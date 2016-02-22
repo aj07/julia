@@ -9,36 +9,42 @@ const MAX_TUPLE_DEPTH = 4
 
 
 type Inference
+    # info on the state of inference and the linfo
     localvarinfo
     frameinfo
+    # return type
+    bestguess::Type = Union{}
+    # current active instruction pointers
     ip::IntSet = []
-    nedges::Int = 0
+    # call-graph edges connecting from a caller to a callee (and back)
     edges::Dict{(Inference, Int), Type} = []
     backedges::Dict{(Inference, Int), Type} = []
-    bestguess::Type = Union{}
+    # iteration fixed-point detection
     stuck::Bool
     fixedpoint::Bool
 end
 # variables with names `i` and `me` are of type Inference
 # variables with the name `j` are of type Int and are an instruction-pointer
 
-workq::Set{Inference} = []
-fp::Set{Inference} = []
+# current global inference state
+workq::Set{Inference} = [] # set of Inference objects that can make immediate progress
+fp::Set{Inference} = [] # set of Inference objects that are stuck at a fixed-point
 
 function finish(me)
     # inference completed on `me`
     # update the LambdaInfo and notify the edges
     @assert me.fixedpoint = true && me.stuck = true
+    # finalize and record the linfo
     me.linfo.inferred = true
     me.linfo.rettype = me.bestguess
     for i in me.edges
         @assert i in fp
     end
+    # update all of the callers by traversing the backedges
     for ((i,j), _) in me.backedges
         if !i.fixedpoint
-            # wake up backedges, unless they were part of reaching this fixedpoint
+            # wake up each backedge, unless it already reached a fixed-point
             pop!(i.edges, (me,j))
-            i.nedges -= 1
             push!(i.ip, j)
             i.stuck = false
             push!(workq, i)
@@ -78,8 +84,11 @@ function typeinf()
     # and returns when there is nothing left
     while !isempty(workq)
         me = pop!(workq)
-        stuck = (isempty(me.ip) && me.nedges != 0)
-        if stuck # if me can't make progress now, can any edge?
+        stuck = (isempty(me.ip) && !isempty(me.edges))
+        if stuck
+            # if me can't make progress now, can any edge?
+            # this is where type-inference handles cycle-detection
+            # and resolution
             me.stuck = true
             me.fixedpoint = false
             for ((i,_), _) in me.edges
@@ -101,10 +110,10 @@ function typeinf()
             end
         end
         while !isempty(me.ip)
+            # make progress on the active ip set
             inst = pop!(me.ip)
-            nedges = inst.nedges # backup nedges to check if any get added
-            typ = state_update(me, inst)
-            if typ == Union{} || nedges != inst.nedges
+            typ = absract_eval(me, inst)
+            if typ == Union{}
                 continue
             end
             if inst == :return
@@ -122,7 +131,8 @@ function typeinf()
                 push!(ip, inst+1)
             end
         end
-        finished = (me.nedges == 0)
+        # with no active ip's, type inference on me is done if there are no outstanding (unfinished) edges
+        finished = isempty(me.edges)
         if finished
             me.fixedpoint = true
             me.stuck = true
@@ -137,7 +147,8 @@ function typeinf()
             end
         end
         if isempty(workq)
-            # nothing in fp has an edge that hasn't reached a fixedpoint
+            # nothing in fp has an edge that hasn't reached a fixed-point
+            # so all of them can be considered finished now
             for i in fp
                 finish(i)
             end
@@ -147,8 +158,10 @@ function typeinf()
 end
 
 function abstract_eval_call((me, j), sig)
+    # type inference sketch for Expr(call, sig) at the IP (me, j)
     lam = method(sig)
     if !lam.inferred
+        # add lam to be inferred and record the edge
         if lam in workq
             infstate = workq[lam]
         else
@@ -156,11 +169,8 @@ function abstract_eval_call((me, j), sig)
             push!(workq, infstate)
         end
         currguess = infstate.bestguess
-        if !haskey((infstate, j), me.edges)
-            infstate.backedges[(me, j)] = currguess
-            me.nedges += 1
-            me.edges[(infstate, j)] = currguess
-        end
+        infstate.backedges[(me, j)] = currguess
+        me.edges[(infstate, j)] = currguess
         return currguess
     else
         return lam.rettype
