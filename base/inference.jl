@@ -17,55 +17,50 @@ type Inference
     # current active instruction pointers
     ip::IntSet = []
     # call-graph edges connecting from a caller to a callee (and back)
-    edges::Dict{(Inference, Int), Type} = []
-    backedges::Dict{(Inference, Int), Type} = []
+    edges::Set{Inference} = []
+    backedges::Set{(Inference, Int)} = []
     # iteration fixed-point detection
-    stuck::Bool
     fixedpoint::Bool
+    inworkq::Bool
 end
 # variables with names `i` and `me` are of type Inference
 # variables with the name `j` are of type Int and are an instruction-pointer
 
 # current global inference state
-workq::Set{Inference} = [] # set of Inference objects that can make immediate progress
-fp::Set{Inference} = [] # set of Inference objects that are stuck at a fixed-point
+active::Dict{LambdaInfo, Inference} = [] # set of all Inference objects being processed
+workq::Vector{Inference} = [] # set of Inference objects that can make immediate progress
 
 function finish(me)
     # inference completed on `me`
     # update the LambdaInfo and notify the edges
-    @assert me.fixedpoint = true && me.stuck = true
     # finalize and record the linfo
     me.linfo.inferred = true
     me.linfo.rettype = me.bestguess
     for i in me.edges
-        @assert i in fp
+        @assert i.fixedpoint
     end
     # update all of the callers by traversing the backedges
-    for ((i,j), _) in me.backedges
-        if !i.fixedpoint
-            # wake up each backedge, unless it already reached a fixed-point
-            pop!(i.edges, (me,j))
-            push!(i.ip, j)
-            i.stuck = false
-            push!(workq, i)
+    for (i,j) in me.backedges
+        if !me.fixedpoint || !i.fixedpoint
+            # wake up each backedge, unless both me and it already reached a fixed-point (cycle resolution stage)
+            delete!(i.edges, me)
+            i.inworkq || push!(workq, i)
+            i.inworkq = true
         end
     end
+    pop!(active, me.linfo)
     nothing
 end
 
 
-function unmark_back(me)
-    # type information changed for me, so it is no longer stuck
+function unmark_fixedpoint(me)
+    # type information changed for me, so its edges are no longer stuck
     # recursively unmark any nodes that had previously been thought to be at a fixedpoint
-    # based upon (recursively) thinking that me was stuck
-    me.stuck = false
+    # based upon (recursively) assuming that me was stuck
     if me.fixedpoint
         me.fixedpoint = false
-        delete!(fp, me)
-    end
-    for ((i,_), _) in me.backedges
-        if i.stuck
-            unmark_back(i)
+        for (i,_) in me.backedges
+            unmark_fixedpoint(i)
         end
     end
 end
@@ -74,8 +69,11 @@ end
 function typeinf(lam)
     # trigger type inference starting from lam
     @assert isempty(workq)
-    push!(workq, Inference(lam))
+    me = Inference(lam)
+    push!(workq, me)
+    me.inworkq = true
     typeinf()
+    nothing
 end
 
 function typeinf()
@@ -84,31 +82,7 @@ function typeinf()
     # and returns when there is nothing left
     while !isempty(workq)
         me = pop!(workq)
-        stuck = (isempty(me.ip) && !isempty(me.edges))
-        if stuck
-            # if me can't make progress now, can any edge?
-            # this is where type-inference handles cycle-detection
-            # and resolution
-            me.stuck = true
-            me.fixedpoint = false
-            for ((i,_), _) in me.edges
-                stuck &= i.stuck
-            end
-            if stuck # all edges are stuck, try continuing with the current information
-                for ((i,j), ty) in me.edges
-                    if (i.bestguess != ty)
-                        # new information, continue with this IP
-                        push!(i.ip, j)
-                        stuck = false
-                    end
-                end
-                me.stuck = stuck
-                if stuck # my edges have all reached a fixed point
-                    me.fixedpoint = true
-                    push!(fp, me)
-                end
-            end
-        end
+        me.inworkq = false
         while !isempty(me.ip)
             # make progress on the active ip set
             inst = pop!(me.ip)
@@ -120,12 +94,11 @@ function typeinf()
                 if me.bestguess != typ
                     # new (wider) return type for me
                     me.bestguess = typejoin(me.bestguess, typ)
-                    for ((i,j), ty) in me.backedges
-                        # update any backedges that thought they might have reached a fixed point
-                        if i.stuck && ty != me.bestguess
-                            unmark_back(i)
-                        end
+                    for (i,j) in me.backedges
+                        # notify backedges of updated type information
+                        push!(i.ip, j)
                     end
+                    unmark_fixedpoint(me)
                 end
             else
                 push!(ip, inst+1)
@@ -133,28 +106,34 @@ function typeinf()
         end
         # with no active ip's, type inference on me is done if there are no outstanding (unfinished) edges
         finished = isempty(me.edges)
-        if finished
-            me.fixedpoint = true
-            me.stuck = true
-            finish(me)
-        elseif isempty(workq) || me.stuck || me.fixedpoint
+        if isempty(workq)
             # oops, there's a cycle somewhere in the `edges` graph
-            # so we've run out off the tree and need to start work on the loop
-            for ((i,_), _) in me.edges
+            # so we've run out off the tree and will need to start work on the loop
+            me.fixedpoint = true
+        end
+        if finished
+            finish(me)
+        elseif me.fixedpoint
+            for i in me.edges
                 if !i.fixedpoint
-                    push!(workq, i)
+                    i.inworkq || push!(workq, i)
+                    i.inworkq = true
+                    i.fixedpoint = true
                 end
             end
         end
         if isempty(workq)
-            # nothing in fp has an edge that hasn't reached a fixed-point
+            # nothing in active has an edge that hasn't reached a fixed-point
             # so all of them can be considered finished now
-            for i in fp
-                finish(i)
+            for (linfo,i) in active
+                if i.fixedpoint
+                    finish(i)
+                end
             end
-            empty!(fp)
         end
     end
+    @assert isempty(active)
+    nothing
 end
 
 function abstract_eval_call((me, j), sig)
@@ -162,16 +141,16 @@ function abstract_eval_call((me, j), sig)
     lam = method(sig)
     if !lam.inferred
         # add lam to be inferred and record the edge
-        if lam in workq
-            infstate = workq[lam]
+        if lam in active
+            infstate = active[lam]
         else
             infstate = Inference(lam)
             push!(workq, infstate)
+            infstate.inworkq = true
         end
-        currguess = infstate.bestguess
-        infstate.backedges[(me, j)] = currguess
-        me.edges[(infstate, j)] = currguess
-        return currguess
+        push!(infstate.backedges, (me, j))
+        push!(me.edges, infstate)
+        return infstate.bestguess
     else
         return lam.rettype
     end
