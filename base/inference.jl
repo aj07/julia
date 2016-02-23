@@ -6,7 +6,7 @@ const MAX_TYPE_DEPTH = 7
 const MAX_TUPLETYPE_LEN  = 42
 const MAX_TUPLE_DEPTH = 4
 
-
+typealias LineNum Int
 
 type Inference
     # info on the state of inference and the linfo
@@ -15,13 +15,15 @@ type Inference
     # return type
     bestguess::Type = Union{}
     # current active instruction pointers
-    ip::IntSet = []
+    ip::IntSet = LineNum[]
     # call-graph edges connecting from a caller to a callee (and back)
-    edges::Set{Inference} = []
-    backedges::Set{(Inference, Int)} = []
+    # we shouldn't need to iterate edges very often, so we use it to optimize the lookup from edge -> linenum
+    # whereas backedges is optimized for iteration
+    edges::Dict{Inference, Vector{LineNum}} = Dict[]
+    backedges::Vector{Tuple{Inference, Vector{LineNum}}} = []
     # iteration fixed-point detection
-    fixedpoint::Bool
-    inworkq::Bool
+    fixedpoint::Bool = false
+    inworkq::Bool = false
 end
 # variables with names `i` and `me` are of type Inference
 # variables with the name `j` are of type Int and are an instruction-pointer
@@ -36,11 +38,11 @@ function finish(me)
     # finalize and record the linfo
     me.linfo.inferred = true
     me.linfo.rettype = me.bestguess
-    for i in me.edges
+    for (i,_) in me.edges
         @assert i.fixedpoint
     end
     # update all of the callers by traversing the backedges
-    for (i,j) in me.backedges
+    for (i,_) in me.backedges
         if !me.fixedpoint || !i.fixedpoint
             # wake up each backedge, unless both me and it already reached a fixed-point (cycle resolution stage)
             delete!(i.edges, me)
@@ -94,9 +96,11 @@ function typeinf()
                 if me.bestguess != typ
                     # new (wider) return type for me
                     me.bestguess = typejoin(me.bestguess, typ)
-                    for (i,j) in me.backedges
+                    for (i,js) in me.backedges
                         # notify backedges of updated type information
-                        push!(i.ip, j)
+                        for j in js
+                            push!(i.ip, j)
+                        end
                     end
                     unmark_fixedpoint(me)
                 end
@@ -114,7 +118,7 @@ function typeinf()
         if finished
             finish(me)
         elseif me.fixedpoint
-            for i in me.edges
+            for (i,js) in me.edges
                 if !i.fixedpoint
                     i.inworkq || push!(workq, i)
                     i.inworkq = true
@@ -148,8 +152,16 @@ function abstract_eval_call((me, j), sig)
             push!(workq, infstate)
             infstate.inworkq = true
         end
-        push!(infstate.backedges, (me, j))
-        push!(me.edges, infstate)
+        if infstate in me.edges
+            js = me.edges[infstate]
+            if !(j in js)
+                push!(js, j)
+            end
+        else
+            js = Int[j]
+            me.edges[infstate] = js
+            push!(infstate.backedges, (me, js))
+        end
         return infstate.bestguess
     else
         return lam.rettype
