@@ -43,6 +43,7 @@ include("operators.jl")
 include("pointer.jl")
 const checked_add = +
 const checked_sub = -
+(::Type{T}){T}(arg) = convert(T, arg)::T
 
 # core array operations
 include("abstractarray.jl")
@@ -71,7 +72,6 @@ include("iterator.jl")
 # compiler
 include("inference.jl")
 
-precompile(CallStack, (Expr, Module, Tuple{Void}, EmptyCallStack))
 precompile(_ieval, (Symbol,))
 precompile(abstract_eval, (LambdaInfo, ObjectIdDict, VarInfo))
 precompile(abstract_interpret, (Bool, ObjectIdDict, VarInfo))

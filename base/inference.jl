@@ -6,173 +6,187 @@ const MAX_TYPE_DEPTH = 7
 const MAX_TUPLETYPE_LEN  = 42
 const MAX_TUPLE_DEPTH = 4
 
+
+immutable NotFound end
+const NF = NotFound()
 typealias LineNum Int
 
-type Inference
+type VarInfo
+    atypes::Type         # type sig
+    ast
+    body::Array{Any,1}   # ast body
+    sp::SimpleVector     # static parameters
+    vars::Array{Any,1}   # names of args and locals
+    gensym_types::Array{Any,1} # types of the GenSym's in this function
+    vinfo::Array{Any,1}  # variable properties
+    label_counter::Int   # index of the current highest label for this function
+    fedbackvars::ObjectIdDict
+    mod::Module
+    currpc::LineNum
+    inf #::InferenceState
+
+    function VarInfo(linfo::LambdaInfo, sig::ANY=linfo.specTypes, ast=linfo.ast)
+        if !isa(ast,Expr)
+            ast = ccall(:jl_uncompress_ast, Any, (Any,Any), linfo, ast)
+        end
+        assert(is(ast.head,:lambda))
+        vinflist = ast.args[2][1]::Array{Any,1}
+        vars = map(vi->vi[1], vinflist)
+        body = (ast.args[3].args)::Array{Any,1}
+        ngs = ast.args[2][3]
+        if !isa(ngs,Int)
+            ngs = length(ngs::Array)
+        end
+        gensym_types = Any[ NF for i = 1:(ngs::Int) ]
+        nl = label_counter(body)+1
+        if length(linfo.sparam_vals) > 0
+            n = length(linfo.sparam_syms)
+            sp = Array(Any, n*2)
+            for i = 1:n
+                sp[i*2-1] = linfo.sparam_syms[i]
+                sp[i*2  ] = linfo.sparam_vals[i]
+            end
+            sp = svec(sp...)
+        else
+            sp = svec()
+        end
+
+        return new(sig, ast, body, sp, vars, gensym_types, vinflist, nl, ObjectIdDict(), linfo.module, 0)
+    end
+end
+
+type VarState
+    typ
+    undef::Bool
+end
+
+type InferenceState
     # info on the state of inference and the linfo
-    localvarinfo
-    frameinfo
+    sv::VarInfo
+    linfo::LambdaInfo
+    args::Vector{Any}
+    labels::Vector{Int}
+    stmt_types::Vector{Any}
     # return type
-    bestguess::Type = Union{}
+    bestguess::Type
     # current active instruction pointers
-    ip::IntSet = LineNum[]
+    ip::IntSet
+    nstmts::Int
+    # current exception handler info
+    cur_hand
+    handler_at::Vector{Any}
+    n_handlers::Int
+    # gensym sparsity and restart info
+    gensym_uses::Vector{IntSet}
+    gensym_init::Vector{Any}
     # call-graph edges connecting from a caller to a callee (and back)
     # we shouldn't need to iterate edges very often, so we use it to optimize the lookup from edge -> linenum
     # whereas backedges is optimized for iteration
-    edges::Dict{Inference, Vector{LineNum}} = Dict[]
-    backedges::Vector{Tuple{Inference, Vector{LineNum}}} = []
+    edges::ObjectIdDict #Dict{InferenceState, Vector{LineNum}}
+    backedges::Vector{Tuple{InferenceState, Vector{LineNum}}}
     # iteration fixed-point detection
-    fixedpoint::Bool = false
-    inworkq::Bool = false
+    fixedpoint::Bool
+    typegotoredo::Bool
+    inworkq::Bool
+    optimize::Bool
+    tfunc_idx::Int
+    function InferenceState(sv::VarInfo, linfo::LambdaInfo, optimize::Bool)
+        body = sv.body
+        labels = zeros(Int, sv.label_counter)
+        for i = 1:length(body)
+            b = body[i]
+            if isa(b,LabelNode)
+                labels[b.label + 1] = i
+            end
+        end
+
+        n = length(body)
+        s = Any[ () for i=1:n ]
+        # initial types
+        s[1] = ObjectIdDict()
+        for v in sv.vars
+            s[1][v] = VarState(Bottom,true)
+        end
+
+        args = f_argnames(sv.ast)
+        la = length(args)
+        atypes = sv.atypes
+        if la > 0
+            lastarg = sv.ast.args[1][la]
+            if is_rest_arg(lastarg)
+                if atypes === Tuple
+                    if la > 1
+                        atypes = Tuple{Any[Any for i=1:la-1]..., Tuple.parameters[1]}
+                    end
+                    s[1][args[la]] = VarState(Tuple,false)
+                else
+                    s[1][args[la]] = VarState(limit_tuple_depth(tupletype_tail(atypes,la)),false)
+                end
+                la -= 1
+            end
+        end
+
+        laty = length(atypes.parameters)
+        if laty > 0
+            lastatype = atypes.parameters[laty]
+            if isvarargtype(lastatype)
+                lastatype = lastatype.parameters[1]
+                laty -= 1
+            end
+            if isa(lastatype, TypeVar)
+                lastatype = lastatype.ub
+            end
+            if laty > la
+                laty = la
+            end
+            for i=1:laty
+                atyp = atypes.parameters[i]
+                if isa(atyp, TypeVar)
+                    atyp = atyp.ub
+                end
+                s[1][args[i]] = VarState(atyp, false)
+            end
+            for i=laty+1:la
+                s[1][args[i]] = VarState(lastatype, false)
+            end
+        else
+            @assert la == 0 # wrong number of arguments
+        end
+
+        gensym_uses = find_gensym_uses(body)
+        if length(sv.gensym_types) != length(gensym_uses)
+            sv.gensym_types = Any[ NF for i=1:length(gensym_uses) ]
+        end
+        gensym_init = copy(sv.gensym_types)
+
+        # exception handlers
+        cur_hand = ()
+        handler_at = Any[ 0 for i=1:n ]
+        n_handlers = 0
+
+        W = IntSet()
+        push!(W, 1) #initial pc to visit
+
+        frame = new(sv, linfo, args, labels, s, Union{}, W, n,
+            cur_hand, handler_at, n_handlers,
+            gensym_uses, gensym_init,
+            ObjectIdDict(), #Dict{InferenceState, Vector{LineNum}}(),
+            Vector{Tuple{InferenceState, Vector{LineNum}}}(),
+            false, false, false, optimize, -1)
+        active[frame] = true
+        sv.inf = frame
+        return frame
+    end
 end
-# variables with names `i` and `me` are of type Inference
-# variables with the name `j` are of type Int and are an instruction-pointer
+# variables with names `i` and `me` are of type InferenceState
+# variables with the name `j` are of type LineNum and are an instruction-pointer
+# variables with the name `sv` are of type VarInfo
 
 # current global inference state
-active::Dict{LambdaInfo, Inference} = [] # set of all Inference objects being processed
-workq::Vector{Inference} = [] # set of Inference objects that can make immediate progress
+const active = ObjectIdDict() #Set{InferenceState}() # set of all InferenceState objects being processed
+const workq = Vector{InferenceState}() # set of InferenceState objects that can make immediate progress
 
-function finish(me)
-    # inference completed on `me`
-    # update the LambdaInfo and notify the edges
-    # finalize and record the linfo
-    me.linfo.inferred = true
-    me.linfo.rettype = me.bestguess
-    for (i,_) in me.edges
-        @assert i.fixedpoint
-    end
-    # update all of the callers by traversing the backedges
-    for (i,_) in me.backedges
-        if !me.fixedpoint || !i.fixedpoint
-            # wake up each backedge, unless both me and it already reached a fixed-point (cycle resolution stage)
-            delete!(i.edges, me)
-            i.inworkq || push!(workq, i)
-            i.inworkq = true
-        end
-    end
-    pop!(active, me.linfo)
-    nothing
-end
-
-
-function unmark_fixedpoint(me)
-    # type information changed for me, so its edges are no longer stuck
-    # recursively unmark any nodes that had previously been thought to be at a fixedpoint
-    # based upon (recursively) assuming that me was stuck
-    if me.fixedpoint
-        me.fixedpoint = false
-        for (i,_) in me.backedges
-            unmark_fixedpoint(i)
-        end
-    end
-end
-
-
-function typeinf(lam)
-    # trigger type inference starting from lam
-    @assert isempty(workq)
-    me = Inference(lam)
-    push!(workq, me)
-    me.inworkq = true
-    typeinf()
-    nothing
-end
-
-function typeinf()
-    # the core type-inference algorithm
-    # processes everything in workq,
-    # and returns when there is nothing left
-    while !isempty(workq)
-        me = pop!(workq)
-        me.inworkq = false
-        while !isempty(me.ip)
-            # make progress on the active ip set
-            inst = pop!(me.ip)
-            typ = absract_eval(me, inst)
-            if typ == Union{}
-                continue
-            end
-            if inst == :return
-                if me.bestguess != typ
-                    # new (wider) return type for me
-                    me.bestguess = typejoin(me.bestguess, typ)
-                    for (i,js) in me.backedges
-                        # notify backedges of updated type information
-                        for j in js
-                            push!(i.ip, j)
-                        end
-                    end
-                    unmark_fixedpoint(me)
-                end
-            else
-                push!(ip, inst+1)
-            end
-        end
-        # with no active ip's, type inference on me is done if there are no outstanding (unfinished) edges
-        finished = isempty(me.edges)
-        if isempty(workq)
-            # oops, there's a cycle somewhere in the `edges` graph
-            # so we've run out off the tree and will need to start work on the loop
-            me.fixedpoint = true
-        end
-        if finished
-            finish(me)
-        elseif me.fixedpoint
-            for (i,js) in me.edges
-                if !i.fixedpoint
-                    i.inworkq || push!(workq, i)
-                    i.inworkq = true
-                    i.fixedpoint = true
-                end
-            end
-        end
-        if isempty(workq)
-            # nothing in active has an edge that hasn't reached a fixed-point
-            # so all of them can be considered finished now
-            for (linfo,i) in active
-                if i.fixedpoint
-                    finish(i)
-                end
-            end
-        end
-    end
-    @assert isempty(active)
-    nothing
-end
-
-function abstract_eval_call((me, j), sig)
-    # type inference sketch for Expr(call, sig) at the IP (me, j)
-    lam = method(sig)
-    if !lam.inferred
-        # add lam to be inferred and record the edge
-        if lam in active
-            infstate = active[lam]
-        else
-            infstate = Inference(lam)
-            push!(workq, infstate)
-            infstate.inworkq = true
-        end
-        if infstate in me.edges
-            js = me.edges[infstate]
-            if !(j in js)
-                push!(js, j)
-            end
-        else
-            js = Int[j]
-            me.edges[infstate] = js
-            push!(infstate.backedges, (me, js))
-        end
-        return infstate.bestguess
-    else
-        return lam.rettype
-    end
-end
-
-
-
-
-
-
+##### helper functions ####
 
 # avoid cycle due to over-specializing `any` when used by inference
 function _any(f::ANY, a)
@@ -181,70 +195,6 @@ function _any(f::ANY, a)
     end
     return false
 end
-
-immutable NotFound
-end
-
-const NF = NotFound()
-
-type VarInfo
-    sp::SimpleVector     # static parameters
-    vars::Array{Any,1}   # names of args and locals
-    gensym_types::Array{Any,1} # types of the GenSym's in this function
-    vinfo::Array{Any,1}  # variable properties
-    label_counter::Int   # index of the current highest label for this function
-    fedbackvars::ObjectIdDict
-    mod::Module
-end
-
-function VarInfo(linfo::LambdaInfo, ast=linfo.ast)
-    if !isa(ast,Expr)
-        ast = ccall(:jl_uncompress_ast, Any, (Any,Any), linfo, ast)
-    end
-    vinflist = ast.args[2][1]::Array{Any,1}
-    vars = map(vi->vi[1], vinflist)
-    body = (ast.args[3].args)::Array{Any,1}
-    ngs = ast.args[2][3]
-    if !isa(ngs,Int)
-        ngs = length(ngs::Array)
-    end
-    gensym_types = Any[ NF for i = 1:(ngs::Int) ]
-    nl = label_counter(body)+1
-    if length(linfo.sparam_vals) > 0
-        n = length(linfo.sparam_syms)
-        sp = Array(Any, n*2)
-        for i = 1:n
-            sp[i*2-1] = linfo.sparam_syms[i]
-            sp[i*2  ] = linfo.sparam_vals[i]
-        end
-        sp = svec(sp...)
-    else
-        sp = svec()
-    end
-    VarInfo(sp, vars, gensym_types, vinflist, nl, ObjectIdDict(), linfo.module)
-end
-
-type VarState
-    typ
-    undef::Bool
-end
-
-type EmptyCallStack
-end
-
-type CallStack
-    ast
-    types::Type
-    recurred::Bool
-    cycleid::Int
-    result
-    prev::Union{EmptyCallStack,CallStack}
-    sv::VarInfo
-
-    CallStack(ast, types::ANY, prev) = new(ast, types, false, 0, Bottom, prev)
-end
-
-inference_stack = EmptyCallStack()
 
 function is_static_parameter(sv::VarInfo, s::Symbol)
     sp = sv.sp
@@ -291,6 +241,11 @@ function istopfunction(topmod, f::ANY, sym)
 end
 
 isknownlength(t::DataType) = !isvatuple(t) && !(t.name===NTuple.name && !isa(t.parameters[1],Int))
+
+# t[n:end]
+tupletype_tail(t::ANY, n) = Tuple{t.parameters[n:end]...}
+
+#### type-functions for builtins / intrinsics ####
 
 cmp_tfunc = (x,y)->Bool
 
@@ -546,16 +501,15 @@ function valid_tparam(x::ANY)
     return isa(x,Int) || isa(x,Symbol) || isa(x,Bool) || (!isa(x,Type) && isbits(x))
 end
 
-function extract_simple_tparam(Ai)
+function extract_simple_tparam(Ai, sv)
     if !isa(Ai,Symbol) && !isa(Ai,GenSym) && valid_tparam(Ai)
         return Ai
     elseif isa(Ai,QuoteNode) && valid_tparam(Ai.value)
         return Ai.value
-    elseif isa(inference_stack,CallStack) && isa(Ai,Expr) &&
-            is_known_call(Ai,tuple,inference_stack.sv)
+    elseif isa(Ai,Expr) && is_known_call(Ai,tuple,sv)
         tup = ()
         for arg in Ai.args[2:end]
-            val = extract_simple_tparam(arg)
+            val = extract_simple_tparam(arg, sv)
             if val === Bottom
                 return val
             end
@@ -606,12 +560,12 @@ const apply_type_tfunc = function (A::ANY, args...)
             push!(tparams, aip1)
         else
             if i<=lA
-                val = extract_simple_tparam(A[i])
+                val = extract_simple_tparam(A[i], global_sv::VarInfo)
                 if val !== Bottom
                     push!(tparams, val)
                     continue
-                elseif isa(inference_stack,CallStack) && isa(A[i],Symbol)
-                    sp = inference_stack.sv.sp
+                elseif isa(A[i],Symbol)
+                    sp = global_sv.sp
                     s = A[i]
                     found = false
                     for j=1:2:length(sp)
@@ -834,9 +788,9 @@ let stagedcache=Dict{Any,Any}()
     end
 end
 
-function abstract_call_gf(f::ANY, fargs, argtype::ANY, e)
+function abstract_call_gf(f::ANY, fargs, argtype::ANY, e, sv)
     argtypes = argtype.parameters
-    tm = _topmod((inference_stack::CallStack).sv)  # TODO pass in sv instead
+    tm = _topmod(sv)
     if length(argtypes)>2 && argtypes[3]===Int &&
         (argtypes[2] <: Tuple ||
          (isa(argtypes[2], DataType) && isdefined(Main, :Base) && isdefined(Main.Base, :Pair) &&
@@ -856,11 +810,11 @@ function abstract_call_gf(f::ANY, fargs, argtype::ANY, e)
     if istopfunction(tm, f, :promote_type) || istopfunction(tm, f, :typejoin)
         return Type
     end
-    return abstract_call_gf_by_type(f, argtype, e)
+    return abstract_call_gf_by_type(f, argtype, e, sv)
 end
 
-function abstract_call_gf_by_type(f::ANY, argtype::ANY, e)
-    tm = _topmod((inference_stack::CallStack).sv)  # TODO pass in sv instead
+function abstract_call_gf_by_type(f::ANY, argtype::ANY, e, sv)
+    tm = _topmod(sv)
     # don't consider more than N methods. this trades off between
     # compiler performance and generated code performance.
     # typically, considering many methods means spending lots of time
@@ -872,7 +826,7 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e)
     argtypes = argtype.parameters
     applicable = _methods_by_ftype(argtype, 4)
     rettype = Bottom
-    if is(applicable,false)
+    if is(applicable, false)
         # this means too many methods matched
         isa(e,Expr) && (e.head = :call)
         return Any
@@ -889,7 +843,7 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e)
         sig = m[1]
         local linfo
         linfo = try
-            func_for_method(m[3],sig,m[2])
+            func_for_method(m[3], sig, m[2])
         catch
             NF
         end
@@ -899,39 +853,39 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e)
         end
         linfo = linfo::LambdaInfo
         lsig = length(m[3].sig.parameters)
-        # limit argument type tuple based on size of definition signature.
-        # for example, given function f(T, Any...), limit to 3 arguments
-        # instead of the default (MAX_TUPLETYPE_LEN)
-        sp = inference_stack
-        limit = false
-        # look at the stack to detect recursive calls with growing argument lists
-        while sp !== EmptyCallStack()
-            if linfo.ast === sp.ast && length(argtypes) > length(sp.types.parameters)
-                limit = true; break
-            end
-            sp = sp.prev
-        end
-        ls = length(sig.parameters)
-        if limit && ls > lsig+1
-            if !istopfunction(tm, f, :promote_typeof)
-                fst = sig.parameters[lsig+1]
-                allsame = true
-                # allow specializing on longer arglists if all the trailing
-                # arguments are the same, since there is no exponential
-                # blowup in this case.
-                for i = lsig+2:ls
-                    if sig.parameters[i] != fst
-                        allsame = false
-                        break
-                    end
-                end
-                if !allsame
-                    sig = limit_tuple_type_n(sig, lsig+1)
-                end
-            end
-        end
+#        # limit argument type tuple based on size of definition signature.
+#        # for example, given function f(T, Any...), limit to 3 arguments
+#        # instead of the default (MAX_TUPLETYPE_LEN)
+#        sp = inference_stack
+#        limit = false
+#        # look at the stack to detect recursive calls with growing argument lists
+#        while sp !== EmptyCallStack()
+#            if linfo.ast === sp.ast && length(argtypes) > length(sp.types.parameters)
+#                limit = true; break
+#            end
+#            sp = sp.prev
+#        end
+#        ls = length(sig.parameters)
+#        if limit && ls > lsig+1
+#            if !istopfunction(tm, f, :promote_typeof)
+#                fst = sig.parameters[lsig+1]
+#                allsame = true
+#                # allow specializing on longer arglists if all the trailing
+#                # arguments are the same, since there is no exponential
+#                # blowup in this case.
+#                for i = lsig+2:ls
+#                    if sig.parameters[i] != fst
+#                        allsame = false
+#                        break
+#                    end
+#                end
+#                if !allsame
+#                    sig = limit_tuple_type_n(sig, lsig+1)
+#                end
+#            end
+#        end
         #print(m,"\n")
-        (_tree,rt) = typeinf(linfo, sig, m[2], linfo)
+        (_tree, rt) = typeinf_edge(linfo, sig, m[2], sv)
         rettype = tmerge(rettype, rt)
         if is(rettype,Any)
             break
@@ -964,7 +918,7 @@ function invoke_tfunc(f::ANY, types::ANY, argtype::ANY)
     if linfo === NF
         return Any
     end
-    return typeinf(linfo::LambdaInfo, ti, env, linfo)[2]
+    return typeinf(linfo::LambdaInfo, ti, env)[2]
 end
 
 # `types` is an array of inferred types for expressions in `args`.
@@ -1085,7 +1039,7 @@ function pure_eval_call(f::ANY, fargs, argtypes::ANY, sv, e)
         return false
     end
     if !linfo.pure
-        typeinf(linfo, meth[1], meth[2], linfo)
+        typeinf(linfo, meth[1], meth[2])
         if !linfo.pure
             return false
         end
@@ -1172,7 +1126,7 @@ function abstract_call(f::ANY, fargs, argtypes::Vector{Any}, vtypes, sv::VarInfo
         rt = builtin_tfunction(f, fargs, Tuple{argtypes[2:end]...})
         return isa(rt, TypeVar) ? rt.ub : rt
     end
-    return abstract_call_gf(f, fargs, Tuple{argtypes...}, e)
+    return abstract_call_gf(f, fargs, Tuple{argtypes...}, e, sv)
 end
 
 function abstract_eval_call(e, vtypes, sv::VarInfo)
@@ -1197,7 +1151,7 @@ function abstract_eval_call(e, vtypes, sv::VarInfo)
             end
             # non-constant function, but type is known
             if (isleaftype(ft) || ft <: Type) && !(ft <: Builtin) && !(ft <: IntrinsicFunction)
-                return abstract_call_gf_by_type(nothing, Tuple{argtypes...}, e)
+                return abstract_call_gf_by_type(nothing, Tuple{argtypes...}, e, sv)
             end
             return Any
         end
@@ -1266,7 +1220,7 @@ function abstract_eval(e::ANY, vtypes, sv::VarInfo)
             end
         elseif isleaftype(t)
             t = Type{t}
-        elseif isleaftype(inference_stack.types)
+        elseif isleaftype(sv.atypes)
             if isa(t,TypeVar)
                 t = Type{t.ub}
             else
@@ -1549,26 +1503,9 @@ f_argnames(ast) =
 
 is_rest_arg(arg::ANY) = (ccall(:jl_is_rest_arg,Int32,(Any,), arg) != 0)
 
-function typeinf_ext(linfo, atypes::ANY, def)
-    global inference_stack
-    last = inference_stack
-    inference_stack = EmptyCallStack()
-    result = typeinf(linfo, atypes, svec(), def, true, true)
-    inference_stack = last
-    return result
-end
 
-typeinf(linfo,atypes::ANY,sparams::ANY) = typeinf(linfo,atypes,sparams,linfo,true,false)
-typeinf(linfo,atypes::ANY,sparams::ANY,def) = typeinf(linfo,atypes,sparams,def,true,false)
-
-CYCLE_ID = 1
-
-#trace_inf = false
-#enable_trace_inf(on) = (global trace_inf=on)
-
-# def is the original unspecialized version of a method. we aggregate all
-# saved type inference data there.
-function typeinf(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, def, cop, needtree)
+function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, needtree, optimize, cached, caller)
+    #println(linfo)
     if linfo.module === Core && isempty(sparams) && isempty(linfo.sparam_vals)
         atypes = Tuple
     end
@@ -1576,21 +1513,19 @@ function typeinf(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, def, cop
     #dotrace = true
     local ast::Expr, tfunc_idx = -1
     curtype = Bottom
-    redo = false
     # check cached t-functions
-    tf = def.tfunc
-    if !is(tf,nothing)
+    # linfo.def is the original unspecialized version of a method.
+    # we aggregate all saved type inference data there.
+    tf = linfo.def.tfunc
+    if cached && !is(tf, nothing)
         tfarr = tf::Array{Any,1}
         for i = 1:3:length(tfarr)
-            if typeseq(tfarr[i],atypes)
-                code = tfarr[i+1]
-                if tfarr[i+2]
-                    redo = true
-                    tfunc_idx = i+1
-                    curtype = code
-                    break
-                end
-                if isa(code,Type)
+            if typeseq(tfarr[i], atypes)
+                code = tfarr[i + 1]
+                if isa(code, InferenceState)
+                    frame = code
+                    tfunc_idx = i
+                elseif isa(code, Type)
                     curtype = code::Type
                     # sometimes just a return type is stored here. if a full AST
                     # is not needed, we can return it.
@@ -1598,449 +1533,399 @@ function typeinf(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, def, cop
                         return (nothing, code)
                     end
                 else
-                    return code  # else code is a tuple (ast, type)
+                    if linfo.inInference
+                        linfo.inferred = true
+                        linfo.ast = code[1]
+                        linfo.rettype = code[2]
+                        linfo.inInference = false
+                    end
+                    return code  # code is a tuple (ast, type)
                 end
             end
         end
     end
-    # TODO: typeinf currently gets stuck without this
-    if linfo.name === :abstract_interpret || linfo.name === :tuple_elim_pass || linfo.name === :abstract_call_gf
-        return (linfo.ast, Any)
-    end
+#    # TODO: typeinf currently gets stuck without this
+#    if linfo.name === :abstract_interpret || linfo.name === :tuple_elim_pass || linfo.name === :abstract_call_gf
+#        return (linfo.ast, Any)
+#    end
 
-    (fulltree, result, rec) = typeinf_uncached(linfo, atypes, sparams, def, curtype, cop, true)
-    if fulltree === ()
-        return (fulltree, result::Type)
-    end
+#    ast0 = def.ast
+#    global inference_stack, CYCLE_ID
+#    f = inference_stack
+#    while !isa(f,EmptyCallStack)
+#        if is(f.ast,ast0)
+#            # impose limit if we recur and the argument types grow beyond MAX_TYPE_DEPTH
+#            td = type_depth(atypes)
+#            if td > type_depth(f.types)
+#                if td > MAX_TYPE_DEPTH
+#                    atypes = limit_type_depth(atypes, 0, true, [])
+#                    break
+#                else
+#                    p1, p2 = atypes.parameters, f.types.parameters
+#                    n = length(p1)
+#                    if length(p2) == n
+#                        limited = false
+#                        newatypes = Array(Any, n)
+#                        for i = 1:n
+#                            if p1[i] <: Function && type_depth(p1[i]) > type_depth(p2[i]) &&
+#                                isa(p1[i],DataType)
+#                                # if a Function argument is growing (e.g. nested closures)
+#                                # then widen to the outermost function type. without this
+#                                # inference fails to terminate on do_quadgk.
+#                                newatypes[i] = p1[i].name.primary
+#                                limited = true
+#                            else
+#                                newatypes[i] = p1[i]
+#                            end
+#                        end
+#                        if limited
+#                            atypes = Tuple{newatypes...}
+#                            break
+#                        end
+#                    end
+#                end
+#            end
+#        end
+#        f = f.prev
+#    end
 
-    if !redo
-        if is(def.tfunc,nothing)
-            def.tfunc = Any[]
-        end
-        tfarr = def.tfunc::Array{Any,1}
-        idx = -1
-        for i = 1:3:length(tfarr)
-            if typeseq(tfarr[i],atypes)
-                idx = i; break
+    if tfunc_idx == -1
+        # add lam to be inferred and record the edge
+        ast = ccall(:jl_prepare_ast, Any, (Any,), linfo)::Expr
+
+        sv = VarInfo(linfo, atypes, ast)
+
+        if length(linfo.sparam_vals) > 0
+            # handled by VarInfo constructor
+        else
+            sp = Any[]
+            for i = 1:2:length(sparams)
+                push!(sp, sparams[i].name)
+                push!(sp, sparams[i+1])
             end
+            for i = 1:length(linfo.sparam_syms)
+                sym = linfo.sparam_syms[i]
+                push!(sp, sym)
+                push!(sp, TypeVar(sym, Any, true))
+            end
+            sv.sp = svec(sp...)
         end
-        if idx == -1
+
+        # our stack frame inference context
+        frame = InferenceState(sv, linfo, optimize)
+        #println(atypes)
+        push!(workq, frame)
+        frame.inworkq = true
+
+        if cached
+            if is(linfo.def.tfunc, nothing)
+                linfo.def.tfunc = Any[]
+            end
+            tfarr = linfo.def.tfunc::Array{Any,1}
             l = length(tfarr)
-            idx = l+1
-            resize!(tfarr, l+3)
+            tfunc_idx = l + 1
+            resize!(tfarr, l + 3)
+            tfarr[tfunc_idx] = atypes
+            tfarr[tfunc_idx + 1] = frame
+            tfarr[tfunc_idx + 2] = false
+            frame.tfunc_idx = tfunc_idx
         end
-        tfarr[idx] = atypes
-        # in the "rec" state this tree will not be used again, so store
-        # just the return type in place of it.
-        tfarr[idx+1] = rec ? result : (fulltree,result)
-        tfarr[idx+2] = rec
-    else
-        def.tfunc[tfunc_idx] = rec ? result : (fulltree,result)
-        def.tfunc[tfunc_idx+1] = rec
     end
 
-    return (fulltree, result::Type)
+    if caller !== nothing
+        me = caller.inf
+        if haskey(me.edges, frame)
+            Ws = me.edges[frame]::Vector{Int}
+            if !(caller.currpc in Ws)
+                push!(Ws, caller.currpc)
+            end
+        else
+            @assert caller.currpc > 0
+            Ws = Int[caller.currpc]
+            me.edges[frame] = Ws
+            push!(frame.backedges, (me, Ws))
+        end
+    end
+    typeinf_loop()
+    return (frame.sv.ast, frame.bestguess)
 end
 
-typeinf_uncached(linfo, atypes::ANY, sparams::ANY; optimize=true) =
-    typeinf_uncached(linfo, atypes, sparams, linfo, Bottom, true, optimize)
-
-# t[n:end]
-tupletype_tail(t::ANY, n) = Tuple{t.parameters[n:end]...}
-
+function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, caller)
+    return typeinf_edge(linfo, atypes, sparams, false, true, true, caller)
+end
+function typeinf(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, needtree::Bool=false)
+    return typeinf_edge(linfo, atypes, sparams, needtree, true, true, nothing)
+end
 # compute an inferred (optionally optimized) AST without global effects (i.e. updating the cache)
-function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, def, curtype, cop, optimize)
-    ast0 = def.ast
-    #if dbg
-    #    print("typeinf ", linfo.name, " ", object_id(ast0), "\n")
-    #end
-    # if isdefined(:STDOUT)
-    #     write(STDOUT, "typeinf ")
-    #     write(STDOUT, string(linfo.name))
-    #     write(STDOUT, string(atypes))
-    #     write(STDOUT, '\n')
-    # end
-    #print("typeinf ", ast0, " ", sparams, " ", atypes, "\n")
+function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::ANY; optimize=true)
+    return typeinf_edge(linfo, atypes, sparams, true, optimize, false, nothing)
+end
+function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, optimize)
+    return typeinf_edge(linfo, atypes, sparams, true, optimize, false, nothing)
+end
+function typeinf_ext(linfo)
+    return typeinf(linfo, linfo.specTypes, svec(), true)
+end
 
-    global inference_stack, CYCLE_ID
-
-    f = inference_stack
-    while !isa(f,EmptyCallStack)
-        if is(f.ast,ast0)
-            # impose limit if we recur and the argument types grow beyond MAX_TYPE_DEPTH
-            td = type_depth(atypes)
-            if td > type_depth(f.types)
-                if td > MAX_TYPE_DEPTH
-                    atypes = limit_type_depth(atypes, 0, true, [])
-                    break
+in_typeinf_loop = false
+function typeinf_loop()
+    global in_typeinf_loop
+    if in_typeinf_loop
+        return
+    end
+    in_typeinf_loop = true
+    # the core type-inference algorithm
+    # processes everything in workq,
+    # and returns when there is nothing left
+    while !isempty(active)
+        if isempty(workq)
+            nextframe = first(active)[1]
+            push!(workq, nextframe)
+            nextframe.inworkq = true
+        end
+    #while !isempty(workq)
+        frame = pop!(workq)
+        global global_sv = frame.sv # TODO: actually pass this to all functions that need it
+        frame.inworkq = false
+        W = frame.ip
+        s = frame.stmt_types
+        n = frame.nstmts
+        while !isempty(W)
+            # make progress on the active ip set
+            pc = first(W)
+            while true # inner loop optimizes the common case where it can run straight from pc to pc + 1
+                #print(pc,": ",s[pc],"\n")
+                delete!(W, pc)
+                frame.sv.currpc = pc
+                if frame.handler_at[pc] === 0
+                    frame.handler_at[pc] = frame.cur_hand
                 else
-                    p1, p2 = atypes.parameters, f.types.parameters
-                    n = length(p1)
-                    if length(p2) == n
-                        limited = false
-                        newatypes = Array(Any, n)
-                        for i = 1:n
-                            if p1[i] <: Function && type_depth(p1[i]) > type_depth(p2[i]) &&
-                                isa(p1[i],DataType)
-                                # if a Function argument is growing (e.g. nested closures)
-                                # then widen to the outermost function type. without this
-                                # inference fails to terminate on do_quadgk.
-                                newatypes[i] = p1[i].name.primary
-                                limited = true
-                            else
-                                newatypes[i] = p1[i]
+                    frame.cur_hand = frame.handler_at[pc]
+                end
+                stmt = frame.sv.body[pc]
+                changes = abstract_interpret(stmt, s[pc]::ObjectIdDict, frame.sv)
+                if frame.cur_hand !== ()
+                    # propagate type info to exception handler
+                    l = frame.cur_hand[1]
+                    if stchanged(changes, s[l], frame.sv.vars)
+                        push!(W, l)
+                        s[l] = stupdate(s[l], changes, frame.sv.vars)
+                    end
+                end
+                pc´ = pc+1
+                if isa(changes, StateUpdate) && isa((changes::StateUpdate).var, GenSym)
+                    # directly forward changes to a GenSym to the applicable line
+                    changes = changes::StateUpdate
+                    id = (changes.var::GenSym).id + 1
+                    new = changes.vtype.typ
+                    old = frame.sv.gensym_types[id]
+                    if old===NF || !(new <: old)
+                        frame.sv.gensym_types[id] = tmerge(old, new)
+                        for r in frame.gensym_uses[id]
+                            if !is(s[r], ()) # s[r] === () => unreached statement
+                                push!(W, r)
                             end
                         end
-                        if limited
-                            atypes = Tuple{newatypes...}
-                            break
+                    end
+                elseif isa(stmt, GotoNode)
+                    pc´ = findlabel(frame.labels, stmt.label)
+                elseif isa(stmt, Expr)
+                    hd = stmt.head
+                    if is(hd, :gotoifnot)
+                        condexpr = stmt.args[1]
+                        l = findlabel(frame.labels, stmt.args[2])
+                        # constant conditions
+                        if is(condexpr, true)
+                        elseif is(condexpr, false)
+                            pc´ = l
+                        else
+                            # general case
+                            frame.handler_at[l] = frame.cur_hand
+                            if stchanged(changes, s[l], frame.sv.vars)
+                                # add else branch to active IP list
+                                push!(W, l)
+                                s[l] = stupdate(s[l], changes, frame.sv.vars)
+                            end
+                        end
+                    elseif is(hd, :type_goto)
+                        for i = 2:length(stmt.args)
+                            var = stmt.args[i]::GenSym
+                            # Store types that need to be fed back via type_goto
+                            # in gensym_init. After finishing inference, if any
+                            # of these types changed, start over with the fed-back
+                            # types known from the beginning.
+                            # See issue #3821 (using !typeseq instead of !subtype),
+                            # and issue #7810.
+                            id = var.id+1
+                            vt = frame.sv.gensym_types[id]
+                            ot = frame.gensym_init[id]
+                            if ot===NF || !typeseq(vt, ot)
+                                frame.gensym_init[id] = vt
+                                frame.typegotoredo = true
+                            end
+                            frame.sv.fedbackvars[var] = true
+                        end
+                    elseif is(hd, :return)
+                        pc´ = n + 1
+                        rt = abstract_eval(stmt.args[1], s[pc], frame.sv)
+                        if tchanged(rt, frame.bestguess)
+                            # new (wider) return type for frame
+                            frame.bestguess = tmerge(frame.bestguess, rt)
+                            for (caller, callerW) in frame.backedges
+                                # notify backedges of updated type information
+                                for caller_pc in callerW
+                                    push!(caller.ip, caller_pc)
+                                end
+                            end
+                            unmark_fixedpoint(frame)
+                        end
+                    elseif is(hd, :enter)
+                        l = findlabel(frame.labels, stmt.args[1]::Int)
+                        frame.cur_hand = (l, frame.cur_hand)
+#                        if frame.handler_at[l] === 0
+#                            frame.n_handlers += 1
+#                            if frame.n_handlers > 25
+#                                # too many exception handlers slows down inference a lot.
+#                                # for an example see test/libgit2.jl on 0.5-pre master
+#                                # around e.g. commit c072d1ce73345e153e4fddf656cda544013b1219
+#                                inference_stack = (inference_stack::CallStack).prev
+#                                return (ast0, Any, false)
+#                            end
+#                        end
+                        frame.handler_at[l] = frame.cur_hand
+                    elseif is(hd, :leave)
+                        for i = 1:((stmt.args[1])::Int)
+                            frame.cur_hand = frame.cur_hand[2]
                         end
                     end
                 end
-            end
-        end
-        f = f.prev
-    end
-
-    # check for recursion
-    f = inference_stack
-    while !isa(f,EmptyCallStack)
-        if (is(f.ast,ast0) || f.ast==ast0) && typeseq(f.types, atypes)
-            # return best guess so far
-            (f::CallStack).recurred = true
-            (f::CallStack).cycleid = CYCLE_ID
-            r = inference_stack
-            while !is(r, f)
-                # mark all frames that are part of the cycle
-                r.recurred = true
-                r.cycleid = CYCLE_ID
-                r = r.prev
-            end
-            CYCLE_ID += 1
-            #print("*==> ", f.result,"\n")
-            return ((),f.result,true)
-        end
-        f = f.prev
-    end
-
-    #if trace_inf
-    #    print("typeinf ", linfo.name, " ", atypes, " ", linfo.file,":",linfo.line,"\n")
-    #end
-
-    #if dbg print("typeinf ", linfo.name, " ", atypes, "\n") end
-
-    if cop
-        ast = ccall(:jl_prepare_ast, Any, (Any,), linfo)::Expr
-    else
-        ast = linfo.ast
-    end
-
-    sv = VarInfo(linfo, ast)
-
-    if length(linfo.sparam_vals) > 0
-        # handled by VarInfo constructor
-    else
-        sp = Any[]
-        for i = 1:2:length(sparams)
-            push!(sp, sparams[i].name)
-            push!(sp, sparams[i+1])
-        end
-        for i = 1:length(linfo.sparam_syms)
-            sym = linfo.sparam_syms[i]
-            push!(sp, sym)
-            push!(sp, TypeVar(sym, Any, true))
-        end
-        sv.sp = svec(sp...)
-    end
-
-    args = f_argnames(ast)
-    la = length(args)
-    assert(is(ast.head,:lambda))
-    vinflist = sv.vinfo
-    vars = sv.vars
-    body = (ast.args[3].args)::Array{Any,1}
-    n = length(body)
-
-    labels = zeros(Int, sv.label_counter)
-    for i=1:length(body)
-        b = body[i]
-        if isa(b,LabelNode)
-            labels[b.label+1] = i
-        end
-    end
-
-    # our stack frame
-    frame = CallStack(ast0, atypes, inference_stack)
-    frame.sv = sv
-    inference_stack = frame
-    frame.result = curtype
-
-    rec = false
-    toprec = false
-
-    s = Any[ () for i=1:n ]
-    # initial types
-    s[1] = ObjectIdDict()
-    for v in vars
-        s[1][v] = VarState(Bottom,true)
-    end
-    if la > 0
-        lastarg = ast.args[1][la]
-        if is_rest_arg(lastarg)
-            if atypes === Tuple
-                if la > 1
-                    atypes = Tuple{Any[Any for i=1:la-1]..., Tuple.parameters[1]}
+                if pc´<=n && (frame.handler_at[pc´] = frame.cur_hand; true) &&
+                   stchanged(changes, s[pc´], frame.sv.vars)
+                    s[pc´] = stupdate(s[pc´], changes, frame.sv.vars)
+                    pc = pc´
+                elseif pc´ in W
+                    pc = pc´
+                else
+                    break
                 end
-                s[1][args[la]] = VarState(Tuple,false)
-            else
-                s[1][args[la]] = VarState(limit_tuple_depth(tupletype_tail(atypes,la)),false)
             end
-            la -= 1
+        end
+
+        # with no active ip's, type inference on frame is done if there are no outstanding (unfinished) edges
+        finished = isempty(frame.edges)
+        if isempty(workq)
+            # oops, there's a cycle somewhere in the `edges` graph
+            # so we've run out off the tree and will need to start work on the loop
+            frame.fixedpoint = true
+        end
+
+        if (frame.fixedpoint || finished) && frame.typegotoredo
+            # if any type_gotos changed, clear state and restart.
+            frame.typegotoredo = false
+            for ll = 2:length(s)
+                s[ll] = ()
+            end
+            empty!(W)
+            push!(W, 1)
+            frame.cur_hand = ()
+            frame.handler_at = Any[ () for i=1:n ]
+            frame.n_handlers = 0
+            frame.sv.gensym_types[:] = frame.gensym_init
+            push!(workq, frame)
         else
-            if atypes === Tuple
-                atypes = Tuple{Any[Any for i=1:la]..., Tuple.parameters[1]}
-            end
-        end
-    end
-
-    laty = length(atypes.parameters)
-    if laty > 0
-        lastatype = atypes.parameters[laty]
-        if isvarargtype(lastatype)
-            lastatype = lastatype.parameters[1]
-            laty -= 1
-        end
-        if isa(lastatype, TypeVar)
-            lastatype = lastatype.ub
-        end
-        if laty > la
-            laty = la
-        end
-        for i=1:laty
-            atyp = atypes.parameters[i]
-            if isa(atyp, TypeVar)
-                atyp = atyp.ub
-            end
-            s[1][args[i]] = VarState(atyp, false)
-        end
-        for i=laty+1:la
-            s[1][args[i]] = VarState(lastatype, false)
-        end
-    elseif la != 0
-        return ((), Bottom, false) # wrong number of arguments
-    end
-
-    gensym_uses = find_gensym_uses(body)
-    if length(sv.gensym_types) != length(gensym_uses)
-        sv.gensym_types = Any[ NF for i=1:length(gensym_uses) ]
-    end
-    gensym_types = sv.gensym_types
-    gensym_init = copy(gensym_types)
-
-    recpts = IntSet()  # statements that depend recursively on our value
-    W = IntSet()
-
-    @label typeinf_top
-
-    typegotoredo = false
-
-    # exception handlers
-    cur_hand = ()
-    handler_at = Any[ () for i=1:n ]
-    n_handlers = 0
-
-    push!(W,1) #initial pc to visit
-
-    while !isempty(W)
-        pc = first(W)
-        while true
-            #print(pc,": ",s[pc],"\n")
-            delete!(W, pc)
-            if is(handler_at[pc],())
-                handler_at[pc] = cur_hand
-            else
-                cur_hand = handler_at[pc]
-            end
-            stmt = body[pc]
-            changes = abstract_interpret(stmt, s[pc]::ObjectIdDict, sv)
-            if frame.recurred
-                rec = true
-                if !(isa(frame.prev,CallStack) && frame.prev.cycleid == frame.cycleid)
-                    toprec = true
-                end
-                push!(recpts, pc)
-                #if dbg
-                #    show(pc); print(" recurred\n")
-                #end
-                frame.recurred = false
-            end
-            if !is(cur_hand,())
-                # propagate type info to exception handler
-                l = cur_hand[1]::Int
-                if stchanged(changes, s[l], vars)
-                    push!(W, l)
-                    s[l] = stupdate(s[l], changes, vars)
-                end
-            end
-            pc´ = pc+1
-            if isa(changes,StateUpdate) && isa((changes::StateUpdate).var, GenSym)
-                changes = changes::StateUpdate
-                id = (changes.var::GenSym).id+1
-                new = changes.vtype.typ
-                old = gensym_types[id]
-                if old===NF || !(new <: old)
-                    gensym_types[id] = tmerge(old, new)
-                    for r in gensym_uses[id]
-                        if !is(s[r],()) # s[r] === () => unreached statement
-                            push!(W, r)
-                        end
-                    end
-                end
-            elseif isa(stmt,GotoNode)
-                pc´ = findlabel(labels,stmt.label)
-            elseif isa(stmt,Expr)
-                hd = stmt.head
-                if is(hd,:gotoifnot)
-                    condexpr = stmt.args[1]
-                    l = findlabel(labels,stmt.args[2])
-                    # constant conditions
-                    if is(condexpr,true)
-                    elseif is(condexpr,false)
-                        pc´ = l
-                    else
-                        # general case
-                        handler_at[l] = cur_hand
-                        if stchanged(changes, s[l], vars)
-                            push!(W, l)
-                            s[l] = stupdate(s[l], changes, vars)
-                        end
-                    end
-                elseif is(hd,:type_goto)
-                    for i = 2:length(stmt.args)
-                        var = stmt.args[i]::GenSym
-                        # Store types that need to be fed back via type_goto
-                        # in gensym_init. After finishing inference, if any
-                        # of these types changed, start over with the fed-back
-                        # types known from the beginning.
-                        # See issue #3821 (using !typeseq instead of !subtype),
-                        # and issue #7810.
-                        id = var.id+1
-                        vt = gensym_types[id]
-                        ot = gensym_init[id]
-                        if ot===NF || !typeseq(vt,ot)
-                            gensym_init[id] = vt
-                            typegotoredo = true
-                        end
-                        sv.fedbackvars[var] = true
-                    end
-                elseif is(hd,:return)
-                    pc´ = n+1
-                    rt = abstract_eval(stmt.args[1], s[pc], sv)
-                    if frame.recurred
-                        rec = true
-                        if !(isa(frame.prev,CallStack) && frame.prev.cycleid == frame.cycleid)
-                            toprec = true
-                        end
-                        push!(recpts, pc)
-                        #if dbg
-                        #    show(pc); print(" recurred\n")
-                        #end
-                        frame.recurred = false
-                    end
-                    #if dbg
-                    #    print("at "); show(pc)
-                    #    print(" result is "); show(frame.result)
-                    #    print(" and rt is "); show(rt)
-                    #    print("\n")
-                    #end
-                    if tchanged(rt, frame.result)
-                        frame.result = tmerge(frame.result, rt)
-                        # revisit states that recursively depend on this
-                        for r in recpts
-                            #if dbg
-                            #    print("will revisit ")
-                            #    show(r)
-                            #    print("\n")
-                            #end
-                            push!(W, r)
-                        end
-                    end
-                elseif is(hd,:enter)
-                    l = findlabel(labels,stmt.args[1]::Int)
-                    cur_hand = (l,cur_hand)
-                    if handler_at[l] === ()
-                        n_handlers += 1
-                        if n_handlers > 25
-                            # too many exception handlers slows down inference a lot.
-                            # for an example see test/libgit2.jl on 0.5-pre master
-                            # around e.g. commit c072d1ce73345e153e4fddf656cda544013b1219
-                            inference_stack = (inference_stack::CallStack).prev
-                            return (ast0, Any, false)
-                        end
-                    end
-                    handler_at[l] = cur_hand
-                elseif is(hd,:leave)
-                    for i=1:((stmt.args[1])::Int)
-                        cur_hand = cur_hand[2]
+            if finished
+                finish(frame)
+            elseif frame.fixedpoint
+                for (i,_) in frame.edges
+                    i = i::InferenceState
+                    if !i.fixedpoint
+                        i.inworkq || push!(workq, i)
+                        i.inworkq = true
+                        i.fixedpoint = true
                     end
                 end
             end
-            if pc´<=n && (handler_at[pc´] = cur_hand; true) &&
-               stchanged(changes, s[pc´], vars)
-                s[pc´] = stupdate(s[pc´], changes, vars)
-                pc = pc´
-            elseif pc´ in W
-                pc = pc´
-            else
-                break
+            if isempty(workq)
+                # nothing in active has an edge that hasn't reached a fixed-point
+                # so all of them can be considered finished now
+                for (i,_) in active
+                    i = i::InferenceState
+                    if i.fixedpoint
+                        finish(i)
+                    end
+                end
             end
         end
     end
+    in_typeinf_loop = false
+end
 
-    if typegotoredo
-        # if any type_gotos changed, clear state and restart.
-        for ll = 2:length(s)
-            s[ll] = ()
-        end
-        empty!(W)
-        gensym_types[:] = gensym_init
-        frame.result = curtype
-        @goto typeinf_top
-    end
-    for i = 1:length(gensym_types)
-        if gensym_types[i] === NF
-            gensym_types[i] = Union{}
+function unmark_fixedpoint(frame)
+    # type information changed for frame, so its edges are no longer stuck
+    # recursively unmark any nodes that had previously been thought to be at a fixedpoint
+    # based upon (recursively) assuming that frame was stuck
+    if frame.fixedpoint
+        frame.fixedpoint = false
+        for (i,_) in frame.backedges
+            unmark_fixedpoint(i)
         end
     end
+end
 
-    #print("\n",ast,"\n")
-    #if dbg print("==> ", frame.result,"\n") end
-    if (toprec && typeseq(curtype, frame.result)) || !isa(frame.prev,CallStack)
-        rec = false
-    end
-    fulltree = type_annotate(ast, s, sv, frame.result, args)
-
-    if !rec
-        @assert fulltree.args[3].head === :body
-        if optimize
-            if JLOptions().can_inline == 1
-                fulltree.args[3] = inlining_pass(fulltree.args[3], sv, fulltree)[1]
-                # inlining can add variables
-                sv.vars = append_any(f_argnames(fulltree), map(vi->vi[1], fulltree.args[2][1]))
-                inbounds_meta_elim_pass(fulltree.args[3])
-            end
-            tuple_elim_pass(fulltree, sv)
-            getfield_elim_pass(fulltree.args[3], sv)
+function finish(me)
+    # inference completed on `me`
+    # update the LambdaInfo and notify the edges
+    # finalize and record the linfo
+    pop!(active, me)
+    fulltree = type_annotate(me.sv.ast, me.stmt_types, me.sv, me.bestguess, me.args)
+    @assert fulltree.args[3].head === :body
+    if me.optimize
+        if JLOptions().can_inline == 1
+            fulltree.args[3] = inlining_pass(fulltree.args[3], me.sv, fulltree)[1]
+            # inlining can add variables
+            me.sv.vars = append_any(f_argnames(fulltree), map(vi->vi[1], fulltree.args[2][1]))
+            inbounds_meta_elim_pass(fulltree.args[3])
         end
-        linfo.inferred = true
+        tuple_elim_pass(fulltree, me.sv)
+        getfield_elim_pass(fulltree.args[3], me.sv)
+    end
+    me.sv.ast = fulltree
+
+    compressedtree = ccall(:jl_compress_ast, Any, (Any,Any), me.linfo.def, fulltree)
+    if me.linfo.inInference
         body = Expr(:block)
         body.args = fulltree.args[3].args::Array{Any,1}
-        linfo.pure = popmeta!(body, :pure)[1]
-        fulltree = ccall(:jl_compress_ast, Any, (Any,Any), def, fulltree)
+        me.linfo.pure = popmeta!(body, :pure)[1]
+        me.linfo.inferred = true
+        me.linfo.ast = compressedtree
+        me.linfo.rettype = me.bestguess
+        me.linfo.inInference = false
+    end
+    if me.tfunc_idx != -1
+        me.linfo.def.tfunc[me.tfunc_idx + 1] = (compressedtree, me.bestguess)
+        me.linfo.def.tfunc[me.tfunc_idx + 2] = false
     end
 
-    inference_stack = (inference_stack::CallStack).prev
-    return (fulltree, frame.result, rec)
+    for i = 1:length(me.sv.gensym_types)
+        if me.sv.gensym_types[i] === NF
+            me.sv.gensym_types[i] = Union{}
+        end
+    end
+
+    for (i,_) in me.edges
+        @assert (i::InferenceState).fixedpoint
+    end
+    # update all of the callers by traversing the backedges
+    for (i,_) in me.backedges
+        if !me.fixedpoint || !i.fixedpoint
+            # wake up each backedge, unless both me and it already reached a fixed-point (cycle resolution stage)
+            delete!(i.edges, me)
+            i.inworkq || push!(workq, i)
+            i.inworkq = true
+        end
+    end
+
+    nothing
 end
 
 function record_var_type(e::Symbol, t::ANY, decls)
@@ -2526,8 +2411,8 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atype::ANY, sv::VarInfo, enclosing
     methargs = metharg.parameters
     nm = length(methargs)
 
-    (ast, ty) = typeinf(linfo, metharg, methsp, linfo, true, true)
-    if is(ast,())
+    (ast, ty) = typeinf(linfo, metharg, methsp, true)
+    if is(ast,()) || !linfo.inferred
         return NF
     end
     needcopy = true
@@ -3521,5 +3406,14 @@ function replace_getfield!(ast, e::ANY, tupname, vals, sv, i0)
 end
 
 #tfunc(f,t) = methods(f,t)[1].func.code.tfunc
+
+# make sure that typeinf is executed before turning on typeinf_ext
+# this ensures that typeinf_ext doesn't recurse before it can add the item to the workq
+for m in _methods_by_ftype(Tuple{typeof(typeinf_loop), Vararg{Any}}, 10)
+    typeinf(m[3].func, m[1], m[2], true)
+end
+for m in _methods_by_ftype(Tuple{typeof(typeinf_edge), Vararg{Any}}, 10)
+    typeinf(m[3].func, m[1], m[2], true)
+end
 
 ccall(:jl_set_typeinf_func, Void, (Any,), typeinf_ext)

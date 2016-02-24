@@ -397,6 +397,7 @@ jl_lambda_info_t *jl_method_cache_insert(jl_methtable_t *mt, jl_tupletype_t *typ
 int jl_in_inference = 0;
 void jl_type_infer(jl_lambda_info_t *li, jl_lambda_info_t *def)
 {
+#ifdef ENABLE_INFERENCE
     JL_LOCK(codegen); // Might GC
     int last_ii = jl_in_inference;
     jl_in_inference = 1;
@@ -406,30 +407,22 @@ void jl_type_infer(jl_lambda_info_t *li, jl_lambda_info_t *def)
         // called
         assert(li->inInference == 0);
         li->inInference = 1;
-        jl_value_t *fargs[4];
+        jl_value_t *fargs[2];
         fargs[0] = (jl_value_t*)jl_typeinf_func;
         fargs[1] = (jl_value_t*)li;
-        fargs[2] = (jl_value_t*)li->specTypes;
-        fargs[3] = (jl_value_t*)def;
 #ifdef TRACE_INFERENCE
         jl_printf(JL_STDERR,"inference on ");
         jl_static_show_func_sig(JL_STDERR, (jl_value_t*)argtypes);
         jl_printf(JL_STDERR, "\n");
 #endif
-#ifdef ENABLE_INFERENCE
-        jl_value_t *newast = jl_apply(fargs, 4);
-        jl_value_t *defast = def->ast;
-        li->ast = jl_fieldref(newast, 0);
-        jl_gc_wb(li, li->ast);
-        li->rettype = jl_fieldref(newast, 1);
-        jl_gc_wb(li, li->rettype);
-        // if type inference bails out it returns def->ast
-        li->inferred = li->ast != defast;
-#endif
-        li->inInference = 0;
+        jl_value_t *info = jl_apply(fargs, 2); (void)info;
+        if (!last_ii) {
+            assert(!li->inInference);
+        }
     }
     jl_in_inference = last_ii;
     JL_UNLOCK(codegen);
+#endif
 }
 
 jl_value_t *jl_nth_slot_type(jl_tupletype_t *sig, size_t i)
@@ -1865,43 +1858,39 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t **args, uint32_t nargs)
     */
     jl_lambda_info_t *mfunc = jl_method_table_assoc_exact(mt, args, nargs);
 
-    if (mfunc != NULL) {
-#ifdef JL_TRACE
-        if (traceen)
-            jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->file), mfunc->line);
-#endif
-        if (mfunc->inInference || mfunc->inCompile) {
-            // if inference is running on this function, return a copy
-            // of the function to be compiled without inference and run.
-            return verify_type(jl_call_unspecialized(mfunc->sparam_vals, jl_get_unspecialized(mfunc), args, nargs));
-        }
-        assert(!mfunc->inInference);
-        return verify_type(jl_call_method_internal(mfunc, args, nargs));
-    }
-
-    // cache miss case
-    jl_tupletype_t *tt = arg_type_tuple(args, nargs);
-    // if running inference overwrites this particular method, it becomes
-    // unreachable from the method table, so root mfunc.
-    JL_GC_PUSH2(&tt, &mfunc);
-    mfunc = jl_mt_assoc_by_type(mt, tt, 1, 0);
-
+    jl_tupletype_t *tt = NULL;
     if (mfunc == NULL) {
+        // cache miss case
+        tt = arg_type_tuple(args, nargs);
+        // if running inference overwrites this particular method, it becomes
+        // unreachable from the method table, so root mfunc.
+        JL_GC_PUSH2(&tt, &mfunc);
+        mfunc = jl_mt_assoc_by_type(mt, tt, 1, 0);
+
+        if (mfunc == NULL) {
 #ifdef JL_TRACE
-        if (error_en)
-            show_call(F, args, nargs);
+            if (error_en)
+                show_call(F, args, nargs);
 #endif
-        JL_GC_POP();
-        jl_no_method_error((jl_function_t*)F, args, nargs);
-        // unreachable
+            JL_GC_POP();
+            jl_no_method_error((jl_function_t*)F, args, nargs);
+            // unreachable
+        }
     }
 #ifdef JL_TRACE
     if (traceen)
         jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->file), mfunc->line);
 #endif
-    assert(!mfunc->inInference);
-    jl_value_t *res = jl_call_method_internal(mfunc, args, nargs);
-    JL_GC_POP();
+    jl_value_t *res;
+    if (mfunc->inInference || mfunc->inCompile) {
+        // if inference is running on this function, return a copy
+        // of the function to be compiled without inference and run.
+        res = jl_call_unspecialized(mfunc->sparam_vals, jl_get_unspecialized(mfunc), args, nargs);
+    }
+    else {
+        res = jl_call_method_internal(mfunc, args, nargs);
+    }
+    if (tt) JL_GC_POP();
     return verify_type(res);
 }
 
