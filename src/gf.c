@@ -394,13 +394,10 @@ jl_lambda_info_t *jl_method_cache_insert(jl_methtable_t *mt, jl_tupletype_t *typ
   "def" is the original method definition of which this is an instance;
   can be equal to "li" if not applicable.
 */
-int jl_in_inference = 0;
 void jl_type_infer(jl_lambda_info_t *li, jl_lambda_info_t *def)
 {
 #ifdef ENABLE_INFERENCE
     JL_LOCK(codegen); // Might GC
-    int last_ii = jl_in_inference;
-    jl_in_inference = 1;
     if (jl_typeinf_func != NULL) {
         // TODO: this should be done right before code gen, so if it is
         // interrupted we can try again the next time the function is
@@ -416,11 +413,7 @@ void jl_type_infer(jl_lambda_info_t *li, jl_lambda_info_t *def)
         jl_printf(JL_STDERR, "\n");
 #endif
         jl_value_t *info = jl_apply(fargs, 2); (void)info;
-        if (!last_ii) {
-            assert(!li->inInference);
-        }
     }
-    jl_in_inference = last_ii;
     JL_UNLOCK(codegen);
 #endif
 }

@@ -13,6 +13,9 @@ const NF = NotFound()
 typealias LineNum Int
 typealias VarTable ObjectIdDict
 
+
+#TODO: the distinction between VarInfo and InferenceState is arbitrary and unnecessary
+
 type VarInfo
     atypes #::Type       # type sig
     ast #::Expr
@@ -91,6 +94,7 @@ type InferenceState
     typegotoredo::Bool
     inworkq::Bool
     optimize::Bool
+    inferred::Bool
     tfunc_idx::Int
     function InferenceState(sv::VarInfo, linfo::LambdaInfo, optimize::Bool)
         body = sv.body
@@ -174,7 +178,7 @@ type InferenceState
             gensym_uses, gensym_init,
             ObjectIdDict(), #Dict{InferenceState, Vector{LineNum}}(),
             Vector{Tuple{InferenceState, Vector{LineNum}}}(),
-            false, false, false, optimize, -1)
+            false, false, false, optimize, false, -1)
         push!(active, frame)
         nactive[] += 1
         sv.inf = frame
@@ -860,20 +864,19 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e, sv)
         end
         linfo = linfo::LambdaInfo
         lsig = length(m[3].sig.parameters)
+        ls = length(sig.parameters)
         # limit argument type tuple based on size of definition signature.
         # for example, given function f(T, Any...), limit to 3 arguments
         # instead of the default (MAX_TUPLETYPE_LEN)
         limit = false
-        # look at the `active` set to detect recursive calls with growing argument lists
-#        for i in active
-#            i === nothing && continue
-#            i = i::InferenceState
-#            if i.linfo.def === linfo.def && length(argtypes) > length(i.sv.atypes.parameters)
-#                limit = true
-#                break
-#            end
-#        end
-        ls = length(sig.parameters)
+        # look at the existing edges to detect growing argument lists
+        for (callee, _) in (sv.inf::InferenceState).edges
+            callee = callee::InferenceState
+            if linfo.def === callee.linfo.def && ls > length(callee.sv.atypes.parameters)
+                limit = true
+                break
+            end
+        end
         if limit && ls > lsig+1
             if !istopfunction(tm, f, :promote_typeof)
                 fst = sig.parameters[lsig+1]
@@ -1547,16 +1550,17 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
                     # sometimes just a return type is stored here. if a full AST
                     # is not needed, we can return it.
                     if !needtree
-                        return (nothing, code)
+                        return (nothing, code, true)
                     end
                 else
+                    inftree, inftyp = code
                     if linfo.inInference
                         linfo.inferred = true
-                        linfo.ast = code[1]
-                        linfo.rettype = code[2]
+                        linfo.ast = inftree
+                        linfo.rettype = inftyp
                         linfo.inInference = false
                     end
-                    return code  # code is a tuple (ast, type)
+                    return (inftree, inftyp, true) # code is a tuple (ast, type)
                 end
             end
         end
@@ -1659,7 +1663,7 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
         end
     end
     typeinf_loop()
-    return (frame.sv.ast, frame.bestguess)
+    return (frame.sv.ast, frame.bestguess, frame.inferred)
 end
 
 function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, caller)
@@ -1797,6 +1801,14 @@ function typeinf_loop()
                     elseif is(hd, :enter)
                         l = findlabel(frame.labels, stmt.args[1]::Int)
                         frame.cur_hand = (l, frame.cur_hand)
+                        # propagate type info to exception handler
+                        l = frame.cur_hand[1]
+                        old = s[l]
+                        new = s[pc]::ObjectIdDict
+                        if old === () || stchanged(new, old::ObjectIdDict, frame.sv.vars)
+                            push!(W, l)
+                            s[l] = stupdate(old, new, frame.sv.vars)
+                        end
 #                        if frame.handler_at[l] === 0
 #                            frame.n_handlers += 1
 #                            if frame.n_handlers > 25
@@ -1871,6 +1883,14 @@ function typeinf_loop()
             end
         end
     end
+    # cleanup the active queue
+    empty!(active)
+#    while active[end] === nothing
+#        # this pops everything, but with exaggerated care just in case
+#        # something managed to add something to the queue at the same time
+#        # (or someone decides to use an alternative termination condition)
+#        pop!(active)
+#    end
     in_typeinf_loop = false
     nothing
 end
@@ -1897,9 +1917,25 @@ function finish(me)
     # efficiency, correctness, and recursion-safety
     nactive[] -= 1
     active[findlast(active, me)] = nothing
-    # finalize and record the linfo
+    for (i,_) in me.edges
+        @assert (i::InferenceState).fixedpoint
+    end
+
+    # annotate fulltree with type information
+    for i = 1:length(me.sv.gensym_types)
+        if me.sv.gensym_types[i] === NF
+            me.sv.gensym_types[i] = Union{}
+        end
+    end
     fulltree = type_annotate(me.sv.ast, me.stmt_types, me.sv, me.bestguess, me.args)
+
+    # make sure (meta pure) is stripped from full tree
     @assert fulltree.args[3].head === :body
+    body = Expr(:block)
+    body.args = fulltree.args[3].args::Array{Any,1}
+    ispure = popmeta!(body, :pure)[1]
+
+    # run optimization passes on fulltree
     if me.optimize
         if JLOptions().can_inline == 1
             fulltree.args[3] = inlining_pass(fulltree.args[3], me.sv, fulltree)[1]
@@ -1910,14 +1946,15 @@ function finish(me)
         tuple_elim_pass(fulltree, me.sv)
         getfield_elim_pass(fulltree.args[3], me.sv)
     end
+
+    # finalize and record the linfo result
     me.sv.ast = fulltree
+    me.inferred = true
 
     compressedtree = ccall(:jl_compress_ast, Any, (Any,Any), me.linfo.def, fulltree)
     if me.linfo.inInference
-        body = Expr(:block)
-        body.args = fulltree.args[3].args::Array{Any,1}
-        me.linfo.pure = popmeta!(body, :pure)[1]
         me.linfo.inferred = true
+        me.linfo.pure = ispure
         me.linfo.ast = compressedtree
         me.linfo.rettype = me.bestguess
         me.linfo.inInference = false
@@ -1927,15 +1964,6 @@ function finish(me)
         me.linfo.def.tfunc[me.tfunc_idx + 2] = false
     end
 
-    for i = 1:length(me.sv.gensym_types)
-        if me.sv.gensym_types[i] === NF
-            me.sv.gensym_types[i] = Union{}
-        end
-    end
-
-    for (i,_) in me.edges
-        @assert (i::InferenceState).fixedpoint
-    end
     # update all of the callers by traversing the backedges
     for (i,_) in me.backedges
         if !me.fixedpoint || !i.fixedpoint
@@ -1945,7 +1973,6 @@ function finish(me)
             i.inworkq = true
         end
     end
-
     nothing
 end
 
@@ -2435,8 +2462,8 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atype::ANY, sv::VarInfo, enclosing
     methargs = metharg.parameters
     nm = length(methargs)
 
-    (ast, ty) = typeinf(linfo, metharg, methsp, true)
-    if is(ast,()) || !linfo.inferred
+    (ast, ty, inferred) = typeinf(linfo, metharg, methsp, true)
+    if is(ast,()) || !inferred
         return NF
     end
     needcopy = true
