@@ -1,18 +1,20 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
-# parameters limiting potentially-infinite types
+#### parameters limiting potentially-infinite types ####
 const MAX_TYPEUNION_LEN = 3
 const MAX_TYPE_DEPTH = 7
-const MAX_TUPLETYPE_LEN  = 42
+const MAX_TUPLETYPE_LEN  = 8
 const MAX_TUPLE_DEPTH = 4
 
+#### inference state types ####
 
 immutable NotFound end
 const NF = NotFound()
 typealias LineNum Int
+typealias VarTable ObjectIdDict
 
 type VarInfo
-    atypes::Type         # type sig
+    atypes               # type sig
     ast
     body::Array{Any,1}   # ast body
     sp::SimpleVector     # static parameters
@@ -68,7 +70,7 @@ type InferenceState
     labels::Vector{Int}
     stmt_types::Vector{Any}
     # return type
-    bestguess::Type
+    bestguess
     # current active instruction pointers
     ip::IntSet
     nstmts::Int
@@ -178,15 +180,13 @@ type InferenceState
         return frame
     end
 end
-# variables with names `i` and `me` are of type InferenceState
-# variables with the name `j` are of type LineNum and are an instruction-pointer
-# variables with the name `sv` are of type VarInfo
 
-# current global inference state
+#### current global inference state ####
+
 const active = ObjectIdDict() #Set{InferenceState}() # set of all InferenceState objects being processed
 const workq = Vector{InferenceState}() # set of InferenceState objects that can make immediate progress
 
-##### helper functions ####
+#### helper functions ####
 
 # avoid cycle due to over-specializing `any` when used by inference
 function _any(f::ANY, a)
@@ -244,6 +244,7 @@ isknownlength(t::DataType) = !isvatuple(t) && !(t.name===NTuple.name && !isa(t.p
 
 # t[n:end]
 tupletype_tail(t::ANY, n) = Tuple{t.parameters[n:end]...}
+
 
 #### type-functions for builtins / intrinsics ####
 
@@ -788,6 +789,9 @@ let stagedcache=Dict{Any,Any}()
     end
 end
 
+
+#### recursing into expression ####
+
 function abstract_call_gf(f::ANY, fargs, argtype::ANY, e, sv)
     argtypes = argtype.parameters
     tm = _topmod(sv)
@@ -925,7 +929,7 @@ end
 # if an expression constructs a container (e.g. `svec(x,y,z)`),
 # refine its type to an array of element types. returns an array of
 # arrays of types, or `nothing`.
-function precise_container_types(args, types, vtypes, sv)
+function precise_container_types(args, types, vtypes::VarTable, sv)
     n = length(args)
     assert(n == length(types))
     result = cell(n)
@@ -961,7 +965,7 @@ function precise_container_types(args, types, vtypes, sv)
 end
 
 # do apply(af, fargs...), where af is a function value
-function abstract_apply(af::ANY, fargs, aargtypes::Vector{Any}, vtypes, sv, e)
+function abstract_apply(af::ANY, fargs, aargtypes::Vector{Any}, vtypes::VarTable, sv, e)
     ctypes = precise_container_types(fargs, aargtypes, vtypes, sv)
     if ctypes !== nothing
         # apply with known func with known tuple types
@@ -1071,7 +1075,7 @@ function pure_eval_call(f::ANY, fargs, argtypes::ANY, sv, e)
 end
 
 
-function abstract_call(f::ANY, fargs, argtypes::Vector{Any}, vtypes, sv::VarInfo, e)
+function abstract_call(f::ANY, fargs, argtypes::Vector{Any}, vtypes::VarTable, sv::VarInfo, e)
     t = pure_eval_call(f, fargs, argtypes, sv, e)
     t !== false && return t
     if is(f,_apply) && length(fargs)>1
@@ -1129,7 +1133,7 @@ function abstract_call(f::ANY, fargs, argtypes::Vector{Any}, vtypes, sv::VarInfo
     return abstract_call_gf(f, fargs, Tuple{argtypes...}, e, sv)
 end
 
-function abstract_eval_call(e, vtypes, sv::VarInfo)
+function abstract_eval_call(e, vtypes::VarTable, sv::VarInfo)
     argtypes = Any[abstract_eval(a, vtypes, sv) for a in e.args]
     #print("call ", e.args[1], argtypes, "\n\n")
     for x in argtypes
@@ -1166,7 +1170,7 @@ function abstract_eval_call(e, vtypes, sv::VarInfo)
     return abstract_call(f, e.args, argtypes, vtypes, sv, e)
 end
 
-function abstract_eval(e::ANY, vtypes, sv::VarInfo)
+function abstract_eval(e::ANY, vtypes::VarTable, sv::VarInfo)
     if isa(e,QuoteNode)
         v = (e::QuoteNode).value
         return type_typeof(v)
@@ -1215,9 +1219,9 @@ function abstract_eval(e::ANY, vtypes, sv::VarInfo)
         if is(t,Bottom)
             # if we haven't gotten fed-back type info yet, return Bottom. otherwise
             # Bottom is the actual type of the variable, so return Type{Bottom}.
-            if haskey(sv.fedbackvars, var)
-                t = Type{Bottom}
-            end
+            #if haskey(sv.fedbackvars, var)
+            t = Type{Bottom}
+            #end
         elseif isleaftype(t)
             t = Type{t}
         elseif isleaftype(sv.atypes)
@@ -1315,7 +1319,8 @@ function abstract_eval_symbol(s::Symbol, vtypes::ObjectIdDict, sv::VarInfo)
     return t.typ
 end
 
-typealias VarTable ObjectIdDict
+
+#### handling for statement-position expressions ####
 
 type StateUpdate
     var::Union{Symbol,GenSym}
@@ -1330,11 +1335,12 @@ function getindex(x::StateUpdate, s::Symbol)
     return get(x.state,s,NF)
 end
 
-function abstract_interpret(e::ANY, vtypes, sv::VarInfo)
+function abstract_interpret(e::ANY, vtypes::VarTable, sv::VarInfo)
     !isa(e,Expr) && return vtypes
     # handle assignment
     if is(e.head,:(=))
         t = abstract_eval(e.args[2], vtypes, sv)
+        t === Bottom && return ()
         lhs = e.args[1]
         if isa(lhs,SymbolNode)
             lhs = lhs.name
@@ -1344,9 +1350,11 @@ function abstract_interpret(e::ANY, vtypes, sv::VarInfo)
             return StateUpdate(lhs, VarState(t,false), vtypes)
         end
     elseif is(e.head,:call)
-        abstract_eval(e, vtypes, sv)
+        t = abstract_eval(e, vtypes, sv)
+        t === Bottom && return ()
     elseif is(e.head,:gotoifnot)
-        abstract_eval(e.args[1], vtypes, sv)
+        t = abstract_eval(e.args[1], vtypes, sv)
+        t === Bottom && return ()
     elseif is(e.head,:method)
         fname = e.args[1]
         if isa(fname,Symbol)
@@ -1413,7 +1421,7 @@ schanged(n::ANY, o::ANY) = is(o,NF) || (!is(n,NF) && !issubstate(n, o))
 stupdate(state::Tuple{}, changes::VarTable, vars) = copy(changes)
 stupdate(state::Tuple{}, changes::StateUpdate, vars) = stupdate(ObjectIdDict(), changes, vars)
 
-function stupdate(state::ObjectIdDict, changes::Union{StateUpdate,VarTable}, vars)
+function stupdate(state::VarTable, changes::Union{StateUpdate,VarTable}, vars)
     for i = 1:length(vars)
         v = vars[i]
         newtype = changes[v]
@@ -1436,6 +1444,9 @@ function stchanged(new::Union{StateUpdate,VarTable}, old, vars)
     end
     return false
 end
+
+
+#### helper functions for typeinf initialization and looping ####
 
 function findlabel(labels, l)
     i = l+1 > length(labels) ? 0 : labels[l+1]
@@ -1504,7 +1515,9 @@ f_argnames(ast) =
 is_rest_arg(arg::ANY) = (ccall(:jl_is_rest_arg,Int32,(Any,), arg) != 0)
 
 
-function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, needtree, optimize, cached, caller)
+#### entry points for inferring a LambdaInfo given a type signature ####
+
+function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, needtree::Bool, optimize::Bool, cached::Bool, caller)
     #println(linfo)
     if linfo.module === Core && isempty(sparams) && isempty(linfo.sparam_vals)
         atypes = Tuple
@@ -1544,10 +1557,6 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
             end
         end
     end
-#    # TODO: typeinf currently gets stuck without this
-#    if linfo.name === :abstract_interpret || linfo.name === :tuple_elim_pass || linfo.name === :abstract_call_gf
-#        return (linfo.ast, Any)
-#    end
 
 #    ast0 = def.ast
 #    global inference_stack, CYCLE_ID
@@ -1613,11 +1622,13 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
 
         # our stack frame inference context
         frame = InferenceState(sv, linfo, optimize)
-        #println(atypes)
         push!(workq, frame)
         frame.inworkq = true
 
         if cached
+            #println(linfo)
+            #println(atypes)
+
             if is(linfo.def.tfunc, nothing)
                 linfo.def.tfunc = Any[]
             end
@@ -1657,13 +1668,13 @@ function typeinf(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, needtree
     return typeinf_edge(linfo, atypes, sparams, needtree, true, true, nothing)
 end
 # compute an inferred (optionally optimized) AST without global effects (i.e. updating the cache)
-function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::ANY; optimize=true)
+function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::ANY; optimize::Bool=true)
     return typeinf_edge(linfo, atypes, sparams, true, optimize, false, nothing)
 end
-function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, optimize)
+function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, optimize::Bool)
     return typeinf_edge(linfo, atypes, sparams, true, optimize, false, nothing)
 end
-function typeinf_ext(linfo)
+function typeinf_ext(linfo::LambdaInfo)
     return typeinf(linfo, linfo.specTypes, svec(), true)
 end
 
@@ -1679,7 +1690,7 @@ function typeinf_loop()
     # and returns when there is nothing left
     while !isempty(active)
         if isempty(workq)
-            nextframe = first(active)[1]
+            nextframe = first(active)[1]::InferenceState
             push!(workq, nextframe)
             nextframe.inworkq = true
         end
@@ -1692,7 +1703,7 @@ function typeinf_loop()
         n = frame.nstmts
         while !isempty(W)
             # make progress on the active ip set
-            pc = first(W)
+            local pc::Int = first(W), pc´::Int
             while true # inner loop optimizes the common case where it can run straight from pc to pc + 1
                 #print(pc,": ",s[pc],"\n")
                 delete!(W, pc)
@@ -1704,6 +1715,7 @@ function typeinf_loop()
                 end
                 stmt = frame.sv.body[pc]
                 changes = abstract_interpret(stmt, s[pc]::ObjectIdDict, frame.sv)
+                changes === () && break
                 if frame.cur_hand !== ()
                     # propagate type info to exception handler
                     l = frame.cur_hand[1]
@@ -1728,12 +1740,13 @@ function typeinf_loop()
                         end
                     end
                 elseif isa(stmt, GotoNode)
-                    pc´ = findlabel(frame.labels, stmt.label)
+                    pc´ = findlabel(frame.labels, (stmt::GotoNode).label)
                 elseif isa(stmt, Expr)
+                    stmt = stmt::Expr
                     hd = stmt.head
                     if is(hd, :gotoifnot)
                         condexpr = stmt.args[1]
-                        l = findlabel(frame.labels, stmt.args[2])
+                        l = findlabel(frame.labels, stmt.args[2]::Int)
                         # constant conditions
                         if is(condexpr, true)
                         elseif is(condexpr, false)
@@ -1858,6 +1871,7 @@ function typeinf_loop()
         end
     end
     in_typeinf_loop = false
+    nothing
 end
 
 function unmark_fixedpoint(frame)
@@ -1871,6 +1885,9 @@ function unmark_fixedpoint(frame)
         end
     end
 end
+
+
+#### finalize and record the result of running type inference ####
 
 function finish(me)
     # inference completed on `me`
@@ -2291,6 +2308,9 @@ function ast_localvars(ast)
     end
     locals
 end
+
+
+#### post-inference optimizations ####
 
 # inline functions whose bodies are "inline_worthy"
 # where the function body doesn't contain any argument more than once.
@@ -3406,6 +3426,9 @@ function replace_getfield!(ast, e::ANY, tupname, vals, sv, i0)
 end
 
 #tfunc(f,t) = methods(f,t)[1].func.code.tfunc
+
+
+#### bootstrapping ####
 
 # make sure that typeinf is executed before turning on typeinf_ext
 # this ensures that typeinf_ext doesn't recurse before it can add the item to the workq
