@@ -342,7 +342,6 @@ unsafe_convert{T}(::Type{T}, x::T) = x
 
 (::Type{Array{T,1}}){T}() = Array{T,1}(0)
 (::Type{Array{T,2}}){T}() = Array{T,2}(0, 0)
-(::Type{Array{T,N}}){T,N}() = Array{T,N}(ntuple(x->0, N))
 
 # TODO: possibly turn these into deprecations
 Array{T,N}(::Type{T}, d::NTuple{N,Int}) = Array{T}(d)

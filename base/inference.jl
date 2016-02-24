@@ -14,8 +14,8 @@ typealias LineNum Int
 typealias VarTable ObjectIdDict
 
 type VarInfo
-    atypes               # type sig
-    ast
+    atypes #::Type       # type sig
+    ast #::Expr
     body::Array{Any,1}   # ast body
     sp::SimpleVector     # static parameters
     vars::Array{Any,1}   # names of args and locals
@@ -70,12 +70,12 @@ type InferenceState
     labels::Vector{Int}
     stmt_types::Vector{Any}
     # return type
-    bestguess
+    bestguess #::Type
     # current active instruction pointers
     ip::IntSet
     nstmts::Int
     # current exception handler info
-    cur_hand
+    cur_hand #::Tuple{LineNum, Tuple{LineNum, ...}}
     handler_at::Vector{Any}
     n_handlers::Int
     # gensym sparsity and restart info
@@ -175,7 +175,8 @@ type InferenceState
             ObjectIdDict(), #Dict{InferenceState, Vector{LineNum}}(),
             Vector{Tuple{InferenceState, Vector{LineNum}}}(),
             false, false, false, optimize, -1)
-        active[frame] = true
+        push!(active, frame)
+        nactive[] += 1
         sv.inf = frame
         return frame
     end
@@ -183,7 +184,9 @@ end
 
 #### current global inference state ####
 
-const active = ObjectIdDict() #Set{InferenceState}() # set of all InferenceState objects being processed
+const active = Vector{Any}() # set of all InferenceState objects being processed
+const nactive = Array{Int}(())
+nactive[] = 0
 const workq = Vector{InferenceState}() # set of InferenceState objects that can make immediate progress
 
 #### helper functions ####
@@ -857,37 +860,38 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e, sv)
         end
         linfo = linfo::LambdaInfo
         lsig = length(m[3].sig.parameters)
-#        # limit argument type tuple based on size of definition signature.
-#        # for example, given function f(T, Any...), limit to 3 arguments
-#        # instead of the default (MAX_TUPLETYPE_LEN)
-#        sp = inference_stack
-#        limit = false
-#        # look at the stack to detect recursive calls with growing argument lists
-#        while sp !== EmptyCallStack()
-#            if linfo.ast === sp.ast && length(argtypes) > length(sp.types.parameters)
-#                limit = true; break
-#            end
-#            sp = sp.prev
-#        end
-#        ls = length(sig.parameters)
-#        if limit && ls > lsig+1
-#            if !istopfunction(tm, f, :promote_typeof)
-#                fst = sig.parameters[lsig+1]
-#                allsame = true
-#                # allow specializing on longer arglists if all the trailing
-#                # arguments are the same, since there is no exponential
-#                # blowup in this case.
-#                for i = lsig+2:ls
-#                    if sig.parameters[i] != fst
-#                        allsame = false
-#                        break
-#                    end
-#                end
-#                if !allsame
-#                    sig = limit_tuple_type_n(sig, lsig+1)
-#                end
+        # limit argument type tuple based on size of definition signature.
+        # for example, given function f(T, Any...), limit to 3 arguments
+        # instead of the default (MAX_TUPLETYPE_LEN)
+        limit = false
+        # look at the `active` set to detect recursive calls with growing argument lists
+#        for i in active
+#            i === nothing && continue
+#            i = i::InferenceState
+#            if i.linfo.def === linfo.def && length(argtypes) > length(i.sv.atypes.parameters)
+#                limit = true
+#                break
 #            end
 #        end
+        ls = length(sig.parameters)
+        if limit && ls > lsig+1
+            if !istopfunction(tm, f, :promote_typeof)
+                fst = sig.parameters[lsig+1]
+                allsame = true
+                # allow specializing on longer arglists if all the trailing
+                # arguments are the same, since there is no exponential
+                # blowup in this case.
+                for i = lsig+2:ls
+                    if sig.parameters[i] != fst
+                        allsame = false
+                        break
+                    end
+                end
+                if !allsame
+                    sig = limit_tuple_type_n(sig, lsig+1)
+                end
+            end
+        end
         #print(m,"\n")
         (_tree, rt) = typeinf_edge(linfo, sig, m[2], sv)
         rettype = tmerge(rettype, rt)
@@ -1558,50 +1562,47 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
         end
     end
 
-#    ast0 = def.ast
-#    global inference_stack, CYCLE_ID
-#    f = inference_stack
-#    while !isa(f,EmptyCallStack)
-#        if is(f.ast,ast0)
-#            # impose limit if we recur and the argument types grow beyond MAX_TYPE_DEPTH
-#            td = type_depth(atypes)
-#            if td > type_depth(f.types)
-#                if td > MAX_TYPE_DEPTH
-#                    atypes = limit_type_depth(atypes, 0, true, [])
-#                    break
-#                else
-#                    p1, p2 = atypes.parameters, f.types.parameters
-#                    n = length(p1)
-#                    if length(p2) == n
-#                        limited = false
-#                        newatypes = Array(Any, n)
-#                        for i = 1:n
-#                            if p1[i] <: Function && type_depth(p1[i]) > type_depth(p2[i]) &&
-#                                isa(p1[i],DataType)
-#                                # if a Function argument is growing (e.g. nested closures)
-#                                # then widen to the outermost function type. without this
-#                                # inference fails to terminate on do_quadgk.
-#                                newatypes[i] = p1[i].name.primary
-#                                limited = true
-#                            else
-#                                newatypes[i] = p1[i]
+    if tfunc_idx == -1
+#        for i in active
+#            i === nothing && continue
+#            i = i::InferenceState
+#            if i.linfo.def === linfo.def
+#                # impose limit if we recur and the argument types grow beyond MAX_TYPE_DEPTH
+#                td = type_depth(atypes)
+#                if td > type_depth(i.sv.atypes)
+#                    if td > MAX_TYPE_DEPTH
+#                        atypes = limit_type_depth(atypes, 0, true, [])
+#                        break
+#                    else
+#                        p1, p2 = atypes.parameters, i.sv.atypes.parameters
+#                        n = length(p1)
+#                        if length(p2) == n
+#                            limited = false
+#                            newatypes = Array(Any, n)
+#                            for i = 1:n
+#                                if p1[i] <: Function && type_depth(p1[i]) > type_depth(p2[i]) &&
+#                                    isa(p1[i],DataType)
+#                                    # if a Function argument is growing (e.g. nested closures)
+#                                    # then widen to the outermost function type. without this
+#                                    # inference fails to terminate on do_quadgk.
+#                                    newatypes[i] = p1[i].name.primary
+#                                    limited = true
+#                                else
+#                                    newatypes[i] = p1[i]
+#                                end
 #                            end
-#                        end
-#                        if limited
-#                            atypes = Tuple{newatypes...}
-#                            break
+#                            if limited
+#                                atypes = Tuple{newatypes...}
+#                                break
+#                            end
 #                        end
 #                    end
 #                end
 #            end
 #        end
-#        f = f.prev
-#    end
 
-    if tfunc_idx == -1
         # add lam to be inferred and record the edge
         ast = ccall(:jl_prepare_ast, Any, (Any,), linfo)::Expr
-
         sv = VarInfo(linfo, atypes, ast)
 
         if length(linfo.sparam_vals) > 0
@@ -1688,16 +1689,17 @@ function typeinf_loop()
     # the core type-inference algorithm
     # processes everything in workq,
     # and returns when there is nothing left
-    while !isempty(active)
-        if isempty(workq)
-            nextframe = first(active)[1]::InferenceState
-            push!(workq, nextframe)
-            nextframe.inworkq = true
+    while nactive[] > 0
+        while active[end] === nothing
+            pop!(active)
         end
-    #while !isempty(workq)
-        frame = pop!(workq)
+        if isempty(workq)
+            frame = active[end]::InferenceState
+        else
+            frame = pop!(workq)
+            frame.inworkq = false
+        end
         global global_sv = frame.sv # TODO: actually pass this to all functions that need it
-        frame.inworkq = false
         W = frame.ip
         s = frame.stmt_types
         n = frame.nstmts
@@ -1858,14 +1860,13 @@ function typeinf_loop()
                     end
                 end
             end
-            if isempty(workq)
+            if isempty(workq) && nactive[] > 0
                 # nothing in active has an edge that hasn't reached a fixed-point
                 # so all of them can be considered finished now
-                for (i,_) in active
+                for i in active
+                    i === nothing && continue
                     i = i::InferenceState
-                    if i.fixedpoint
-                        finish(i)
-                    end
+                    i.fixedpoint && finish(i)
                 end
             end
         end
@@ -1889,11 +1890,14 @@ end
 
 #### finalize and record the result of running type inference ####
 
+# inference completed on `me`
+# update the LambdaInfo and notify the edges
 function finish(me)
-    # inference completed on `me`
-    # update the LambdaInfo and notify the edges
+    # lazy-delete the item from active for several reasons:
+    # efficiency, correctness, and recursion-safety
+    nactive[] -= 1
+    active[findlast(active, me)] = nothing
     # finalize and record the linfo
-    pop!(active, me)
     fulltree = type_annotate(me.sv.ast, me.stmt_types, me.sv, me.bestguess, me.args)
     @assert fulltree.args[3].head === :body
     if me.optimize
