@@ -392,16 +392,13 @@ jl_lambda_info_t *jl_method_cache_insert(jl_methtable_t *mt, jl_tupletype_t *typ
 /*
   run type inference on lambda "li" in-place, for given argument types.
   "def" is the original method definition of which this is an instance;
-  can be equal to "li" if not applicable.
+  can be equal to "li->def" if not applicable.
 */
 void jl_type_infer(jl_lambda_info_t *li, jl_lambda_info_t *def)
 {
 #ifdef ENABLE_INFERENCE
-    JL_LOCK(codegen); // Might GC
-    if (jl_typeinf_func != NULL) {
-        // TODO: this should be done right before code gen, so if it is
-        // interrupted we can try again the next time the function is
-        // called
+    if (jl_typeinf_func != NULL && li->module != jl_gf_mtable(jl_typeinf_func)->module) {
+        JL_LOCK(codegen); // Might GC
         assert(li->inInference == 0);
         li->inInference = 1;
         jl_value_t *fargs[2];
@@ -413,8 +410,8 @@ void jl_type_infer(jl_lambda_info_t *li, jl_lambda_info_t *def)
         jl_printf(JL_STDERR, "\n");
 #endif
         jl_value_t *info = jl_apply(fargs, 2); (void)info;
+        JL_UNLOCK(codegen);
     }
-    JL_UNLOCK(codegen);
 #endif
 }
 

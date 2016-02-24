@@ -28,6 +28,7 @@ type VarInfo
     fedbackvars::ObjectIdDict
     mod::Module
     currpc::LineNum
+    static_typeof::Bool
     inf #::InferenceState
 
     function VarInfo(linfo::LambdaInfo, sig::ANY=linfo.specTypes, ast=linfo.ast)
@@ -56,7 +57,7 @@ type VarInfo
             sp = svec()
         end
 
-        return new(sig, ast, body, sp, vars, gensym_types, vinflist, nl, ObjectIdDict(), linfo.module, 0)
+        return new(sig, ast, body, sp, vars, gensym_types, vinflist, nl, ObjectIdDict(), linfo.module, 0, false)
     end
 end
 
@@ -1226,9 +1227,11 @@ function abstract_eval(e::ANY, vtypes::VarTable, sv::VarInfo)
         if is(t,Bottom)
             # if we haven't gotten fed-back type info yet, return Bottom. otherwise
             # Bottom is the actual type of the variable, so return Type{Bottom}.
-            #if haskey(sv.fedbackvars, var)
-            t = Type{Bottom}
-            #end
+            if haskey(sv.fedbackvars, var)
+                t = Type{Bottom}
+            else
+                sv.static_typeof = true
+            end
         elseif isleaftype(t)
             t = Type{t}
         elseif isleaftype(sv.atypes)
@@ -1714,6 +1717,7 @@ function typeinf_loop()
                 #print(pc,": ",s[pc],"\n")
                 delete!(W, pc)
                 frame.sv.currpc = pc
+                frame.sv.static_typeof = false
                 if frame.handler_at[pc] === 0
                     frame.handler_at[pc] = frame.cur_hand
                 else
@@ -1721,7 +1725,13 @@ function typeinf_loop()
                 end
                 stmt = frame.sv.body[pc]
                 changes = abstract_interpret(stmt, s[pc]::ObjectIdDict, frame.sv)
-                changes === () && break
+                if changes === ()
+                    # if there was a Expr(:static_typeof) on this line,
+                    # need to continue to the next pc even though the return type was Bottom
+                    # otherwise, this line threw an error and there is no need to continue
+                    frame.sv.static_typeof || break
+                    changes = s[pc]
+                end
                 if frame.cur_hand !== ()
                     # propagate type info to exception handler
                     l = frame.cur_hand[1]
