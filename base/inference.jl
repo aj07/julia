@@ -25,7 +25,7 @@ type VarInfo
     gensym_types::Array{Any,1} # types of the GenSym's in this function
     vinfo::Array{Any,1}  # variable properties
     label_counter::Int   # index of the current highest label for this function
-    fedbackvars::ObjectIdDict
+    fedbackvars::Dict{GenSym, Bool}
     mod::Module
     currpc::LineNum
     static_typeof::Bool
@@ -57,7 +57,7 @@ type VarInfo
             sp = svec()
         end
 
-        return new(sig, ast, body, sp, vars, gensym_types, vinflist, nl, ObjectIdDict(), linfo.module, 0, false)
+        return new(sig, ast, body, sp, vars, gensym_types, vinflist, nl, Dict{GenSym, Bool}(), linfo.module, 0, false)
     end
 end
 
@@ -1213,7 +1213,7 @@ function abstract_eval(e::ANY, vtypes::VarTable, sv::VarInfo)
         if is(t,Bottom)
             # if we haven't gotten fed-back type info yet, return Bottom. otherwise
             # Bottom is the actual type of the variable, so return Type{Bottom}.
-            if haskey(sv.fedbackvars, var)
+            if get!(sv.fedbackvars, var, false)
                 t = Type{Bottom}
             else
                 sv.static_typeof = true
@@ -1783,7 +1783,9 @@ function typeinf_loop()
                             ot = frame.gensym_init[id]
                             if ot===NF || !typeseq(vt, ot)
                                 frame.gensym_init[id] = vt
-                                frame.typegotoredo = true
+                                if get(frame.sv.fedbackvars, var, false)
+                                    frame.typegotoredo = true
+                                end
                             end
                             frame.sv.fedbackvars[var] = true
                         end
@@ -1849,23 +1851,47 @@ function typeinf_loop()
             frame.fixedpoint = true
         end
 
-        if (frame.fixedpoint || finished) && frame.typegotoredo
-            # if any type_gotos changed, clear state and restart.
-            frame.typegotoredo = false
-            for ll = 2:length(s)
-                s[ll] = ()
+        restart = false
+        if finished || frame.fixedpoint
+            if frame.typegotoredo
+                # if any type_gotos changed, clear state and restart.
+                frame.typegotoredo = false
+                for ll = 2:length(s)
+                    s[ll] = ()
+                end
+                empty!(W)
+                push!(W, 1)
+                frame.cur_hand = ()
+                frame.handler_at = Any[ () for i=1:n ]
+                frame.n_handlers = 0
+                frame.sv.gensym_types[:] = frame.gensym_init
+                restart = true
+            else
+                # if a static_typeof was never reached,
+                # use Union{} as its real type and continue
+                # running type inference from its uses
+                # (one of which is the static_typeof)
+                # TODO: this restart should happen just before calling finish()
+                for (fbvar, seen) in frame.sv.fedbackvars
+                    if !seen
+                        frame.sv.fedbackvars[fbvar] = true
+                        id = (fbvar::GenSym).id + 1
+                        for r in frame.gensym_uses[id]
+                            if !is(s[r], ()) # s[r] === () => unreached statement
+                                push!(W, r)
+                            end
+                        end
+                        restart = true
+                    end
+                end
             end
-            empty!(W)
-            push!(W, 1)
-            frame.cur_hand = ()
-            frame.handler_at = Any[ () for i=1:n ]
-            frame.n_handlers = 0
-            frame.sv.gensym_types[:] = frame.gensym_init
-            push!(workq, frame)
-        else
-            if finished
+
+            if restart
+                push!(workq, frame)
+                frame.inworkq = true
+            elseif finished
                 finish(frame)
-            elseif frame.fixedpoint
+            else # fixedpoint propagation
                 for (i,_) in frame.edges
                     i = i::InferenceState
                     if !i.fixedpoint
@@ -1875,14 +1901,14 @@ function typeinf_loop()
                     end
                 end
             end
-            if isempty(workq) && nactive[] > 0
-                # nothing in active has an edge that hasn't reached a fixed-point
-                # so all of them can be considered finished now
-                for i in active
-                    i === nothing && continue
-                    i = i::InferenceState
-                    i.fixedpoint && finish(i)
-                end
+        end
+        if !restart && isempty(workq) && nactive[] > 0
+            # nothing in active has an edge that hasn't reached a fixed-point
+            # so all of them can be considered finished now
+            for i in active
+                i === nothing && continue
+                i = i::InferenceState
+                i.fixedpoint && finish(i)
             end
         end
     end
