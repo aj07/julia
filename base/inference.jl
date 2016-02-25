@@ -911,7 +911,7 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e, sv)
     return rettype
 end
 
-function invoke_tfunc(f::ANY, types::ANY, argtype::ANY)
+function invoke_tfunc(f::ANY, types::ANY, argtype::ANY, sv::VarInfo)
     argtype = typeintersect(types,limit_tuple_type(argtype))
     if is(argtype,Bottom)
         return Bottom
@@ -933,7 +933,7 @@ function invoke_tfunc(f::ANY, types::ANY, argtype::ANY)
     if linfo === NF
         return Any
     end
-    return typeinf(linfo::LambdaInfo, ti, env)[2]
+    return typeinf_edge(linfo::LambdaInfo, ti, env, sv)[2]
 end
 
 # `types` is an array of inferred types for expressions in `args`.
@@ -1100,7 +1100,7 @@ function abstract_call(f::ANY, fargs, argtypes::Vector{Any}, vtypes::VarTable, s
             af = _ieval(af,sv)
             sig = argtypes[3]
             if isType(sig) && sig.parameters[1] <: Tuple
-                return invoke_tfunc(af, sig.parameters[1], Tuple{argtypes[4:end]...})
+                return invoke_tfunc(af, sig.parameters[1], Tuple{argtypes[4:end]...}, sv)
             end
         end
     end
