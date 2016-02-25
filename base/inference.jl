@@ -1536,7 +1536,7 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
         atypes = Tuple
     end
     tdepth = type_depth(atypes)
-    if tdepth > MAX_TYPE_DEPTH
+    if !linfo.inInference && tdepth > MAX_TYPE_DEPTH
         atypes = limit_type_depth(atypes, 0, true, [])
     end
     local ast::Expr, tfunc_idx = -1
@@ -1687,9 +1687,14 @@ end
 function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, optimize::Bool)
     return typeinf_edge(linfo, atypes, sparams, true, optimize, false, nothing)
 end
-function typeinf_ext(linfo::LambdaInfo)
+function typeinf_ext(linfo::LambdaInfo, toplevel::Bool)
+    if in_typeinf_loop && toplevel
+        linfo.inInference = false
+        return (linfo.ast, linfo.rettype, false)
+    end
     return typeinf(linfo, linfo.specTypes, svec(), true)
 end
+
 
 in_typeinf_loop = false
 function typeinf_loop()
