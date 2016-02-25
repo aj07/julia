@@ -864,21 +864,24 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e, sv)
             break
         end
         linfo = linfo::LambdaInfo
+
+        # limit argument type tuple growth
         lsig = length(m[3].sig.parameters)
         ls = length(sig.parameters)
-        # limit argument type tuple based on size of definition signature.
-        # for example, given function f(T, Any...), limit to 3 arguments
-        # instead of the default (MAX_TUPLETYPE_LEN)
-        limit = false
         # look at the existing edges to detect growing argument lists
+        limitlength = false
         for (callee, _) in (sv.inf::InferenceState).edges
             callee = callee::InferenceState
             if linfo.def === callee.linfo.def && ls > length(callee.sv.atypes.parameters)
-                limit = true
+                limitlength = true
                 break
             end
         end
-        if limit && ls > lsig+1
+
+        # limit length based on size of definition signature.
+        # for example, given function f(T, Any...), limit to 3 arguments
+        # instead of the default (MAX_TUPLETYPE_LEN)
+        if limitlength && ls > lsig + 1
             if !istopfunction(tm, f, :promote_typeof)
                 fst = sig.parameters[lsig+1]
                 allsame = true
@@ -1532,8 +1535,10 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
     if linfo.module === Core && isempty(sparams) && isempty(linfo.sparam_vals)
         atypes = Tuple
     end
-    #dbg =
-    #dotrace = true
+    tdepth = type_depth(atypes)
+    if tdepth > MAX_TYPE_DEPTH
+        atypes = limit_type_depth(atypes, 0, true, [])
+    end
     local ast::Expr, tfunc_idx = -1
     curtype = Bottom
     # check cached t-functions
