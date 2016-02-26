@@ -878,6 +878,54 @@ function abstract_call_gf_by_type(f::ANY, argtype::ANY, e, sv)
             end
         end
 
+        # limit argument type size growth
+        # TODO: FIXME: this heuristic depends on non-local state making type-inference unpredictable
+        for infstate in active
+            infstate === nothing && continue
+            infstate = infstate::InferenceState
+            if linfo.def === infstate.linfo.def
+                td = type_depth(sig)
+                if ls > length(infstate.sv.atypes.parameters)
+                    limitlength = true
+                end
+                if td > type_depth(infstate.sv.atypes)
+                    # impose limit if we recur and the argument types grow beyond MAX_TYPE_DEPTH
+                    if td > MAX_TYPE_DEPTH
+                        sig = limit_type_depth(sig, 0, true, [])
+                        break
+                    else
+                        p1, p2 = sig.parameters, infstate.sv.atypes.parameters
+                        if length(p2) == ls
+                            limitdepth = false
+                            newsig = Array(Any, ls)
+                            for i = 1:ls
+                                if p1[i] <: Function && type_depth(p1[i]) > type_depth(p2[i]) &&
+                                    isa(p1[i],DataType)
+                                    # if a Function argument is growing (e.g. nested closures)
+                                    # then widen to the outermost function type. without this
+                                    # inference fails to terminate on do_quadgk.
+                                    newsig[i] = p1[i].name.primary
+                                    limitdepth  = true
+                                else
+                                    newsig[i] = limit_type_depth(p1[i], 1, true, [])
+                                end
+                            end
+                            if limitdepth
+                                sig = Tuple{newsig...}
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+#        # limit argument type size growth
+#        tdepth = type_depth(sig)
+#        if tdepth > MAX_TYPE_DEPTH
+#            sig = limit_type_depth(sig, 0, true, [])
+#        end
+
         # limit length based on size of definition signature.
         # for example, given function f(T, Any...), limit to 3 arguments
         # instead of the default (MAX_TUPLETYPE_LEN)
@@ -1518,10 +1566,6 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
     if linfo.module === Core && isempty(sparams) && isempty(linfo.sparam_vals)
         atypes = Tuple
     end
-    tdepth = type_depth(atypes)
-    if !linfo.inInference && tdepth > MAX_TYPE_DEPTH
-        atypes = limit_type_depth(atypes, 0, true, [])
-    end
     local ast::Expr, tfunc_idx = -1
     curtype = Bottom
     # check cached t-functions
@@ -1558,44 +1602,16 @@ function typeinf_edge(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector, nee
     end
 
     if tfunc_idx == -1
-#        for i in active
-#            i === nothing && continue
-#            i = i::InferenceState
-#            if i.linfo.def === linfo.def
-#                # impose limit if we recur and the argument types grow beyond MAX_TYPE_DEPTH
-#                td = type_depth(atypes)
-#                if td > type_depth(i.sv.atypes)
-#                    if td > MAX_TYPE_DEPTH
-#                        atypes = limit_type_depth(atypes, 0, true, [])
-#                        break
-#                    else
-#                        p1, p2 = atypes.parameters, i.sv.atypes.parameters
-#                        n = length(p1)
-#                        if length(p2) == n
-#                            limited = false
-#                            newatypes = Array(Any, n)
-#                            for i = 1:n
-#                                if p1[i] <: Function && type_depth(p1[i]) > type_depth(p2[i]) &&
-#                                    isa(p1[i],DataType)
-#                                    # if a Function argument is growing (e.g. nested closures)
-#                                    # then widen to the outermost function type. without this
-#                                    # inference fails to terminate on do_quadgk.
-#                                    newatypes[i] = p1[i].name.primary
-#                                    limited = true
-#                                else
-#                                    newatypes[i] = p1[i]
-#                                end
-#                            end
-#                            if limited
-#                                atypes = Tuple{newatypes...}
-#                                break
-#                            end
-#                        end
-#                    end
-#                end
-#            end
-#        end
-
+        if caller === nothing && needtree && in_typeinf_loop
+            # if the caller needed the ast, but we are already in the typeinf loop
+            # then just return early -- we can't fulfill this request
+            # if the client was typeinf_ext(toplevel), then we cancel the inInference request
+            # if the client was inlining, then this means we decided not to try to infer this
+            # particular signature (due to signature coarsening in abstract_call_gf_by_type)
+            # and attempting to force it now would be a bad idea (non terminating)
+            linfo.inInference = false
+            return (nothing, Union{}, false)
+        end
         # add lam to be inferred and record the edge
         ast = ccall(:jl_prepare_ast, Any, (Any,), linfo)::Expr
         sv = VarInfo(linfo, atypes, ast)
@@ -1671,11 +1687,7 @@ function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector,
     return typeinf_edge(linfo, atypes, sparams, true, optimize, false, nothing)
 end
 function typeinf_ext(linfo::LambdaInfo, toplevel::Bool)
-    if in_typeinf_loop && toplevel
-        linfo.inInference = false
-        return (linfo.ast, linfo.rettype, false)
-    end
-    return typeinf(linfo, linfo.specTypes, svec(), true)
+    return typeinf_edge(linfo, linfo.specTypes, svec(), toplevel, true, true, nothing)
 end
 
 
@@ -2518,7 +2530,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::VarInfo, 
     nm = length(methargs)
 
     (ast, ty, inferred) = typeinf(linfo, metharg, methsp, true)
-    if is(ast,()) || !inferred
+    if is(ast,nothing) || !inferred
         return NF
     end
     needcopy = true
