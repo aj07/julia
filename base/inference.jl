@@ -1102,10 +1102,7 @@ function pure_eval_call(f::ANY, fargs, argtypes::ANY, sv, e)
         return false
     end
     if !linfo.pure
-        typeinf(linfo, meth[1], meth[2])
-        if !linfo.pure
-            return false
-        end
+        return false
     end
 
     try
