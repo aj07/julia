@@ -2429,7 +2429,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atype::ANY, sv::VarInfo, enclosing
         vaname = args[na]
         len_argexprs = length(argexprs)
         valen = len_argexprs-na+1
-        if valen>0 && !occurs_outside_getfield(body, vaname, sv, valen)
+        if valen>0 && !occurs_outside_getfield(body, vaname, sv, valen, ())
             # argument tuple is not used as a whole, so convert function body
             # to one accepting the exact number of arguments we have.
             newnames = unique_names(ast,valen)
@@ -2437,7 +2437,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atype::ANY, sv::VarInfo, enclosing
                 body = astcopy(body)
                 needcopy = false
             end
-            replace_getfield!(ast, body, vaname, newnames, sv, 1)
+            replace_getfield!(ast, body, vaname, newnames, (), sv, 1)
             args = vcat(args[1:na-1], newnames)
             na = length(args)
 
@@ -3190,28 +3190,27 @@ symequal(x::Symbol    , y::SymbolNode) = is(x,y.name)
 symequal(x::GenSym    , y::GenSym)     = is(x.id,y.id)
 symequal(x::ANY       , y::ANY)        = is(x,y)
 
-function occurs_outside_getfield(e::ANY, sym::ANY, sv::VarInfo, tuplen::Int)
+function occurs_outside_getfield(e::ANY, sym::ANY, sv::VarInfo, field_count, field_names)
     if is(e, sym) || (isa(e, SymbolNode) && is(e.name, sym))
         return true
     end
     if isa(e,Expr)
         e = e::Expr
         if is_known_call(e, getfield, sv) && symequal(e.args[2],sym)
-            targ = e.args[2]
-            if !(exprtype(targ,sv) <: Tuple)
-                return true
-            end
             idx = e.args[3]
-            if !isa(idx,Int) || !(1 <= idx <= tuplen)
-                return true
+            if isa(idx,QuoteNode) && (idx.value in field_names)
+                return false
             end
-            return false
+            if isa(idx,Int) && (1 <= idx <= field_count)
+                return false
+            end
+            return true
         end
         if is(e.head,:(=))
-            return occurs_outside_getfield(e.args[2], sym, sv, tuplen)
+            return occurs_outside_getfield(e.args[2], sym, sv, field_count, field_names)
         else
             for a in e.args
-                if occurs_outside_getfield(a, sym, sv, tuplen)
+                if occurs_outside_getfield(a, sym, sv, field_count, field_names)
                     return true
                 end
             end
@@ -3237,30 +3236,37 @@ function getfield_elim_pass(e::Expr, sv)
         if isa(ei,Expr)
             getfield_elim_pass(ei, sv)
             if is_known_call(ei, getfield, sv) && length(ei.args)==3 &&
-                isa(ei.args[3],Int)
+                (isa(ei.args[3],Int) || isa(ei.args[3],QuoteNode))
                 e1 = ei.args[2]
                 j = ei.args[3]
                 if isa(e1,Expr)
-                    if is_known_call(e1, tuple, sv) && (1 <= j < length(e1.args))
-                        ok = true
-                        for k = 2:length(e1.args)
-                            k == j+1 && continue
-                            if !effect_free(e1.args[k], sv, true)
-                                ok = false; break
+                    alloc = is_immutable_allocation(e1, sv)
+                    if !is(alloc, false)
+                        flen, fnames = alloc
+                        if isa(j,QuoteNode)
+                            j = findfirst(fnames, j.value)
+                        end
+                        if 1 <= j <= flen
+                            ok = true
+                            for k = 2:length(e1.args)
+                                k == j+1 && continue
+                                if !effect_free(e1.args[k], sv, true)
+                                    ok = false; break
+                                end
+                            end
+                            if ok
+                                e.args[i] = e1.args[j+1]
                             end
                         end
-                        if ok
-                            e.args[i] = e1.args[j+1]
-                        end
                     end
-                elseif isa(e1,Tuple) && (1 <= j <= length(e1))
+                elseif isa(e1,Tuple) && isa(j,Int) && (1 <= j <= length(e1))
                     e1j = e1[j]
                     if !(isa(e1j,Number) || isa(e1j,AbstractString) || isa(e1j,Tuple) ||
                          isa(e1j,Type))
                         e1j = QuoteNode(e1j)
                     end
                     e.args[i] = e1j
-                elseif isa(e1,QuoteNode) && isa(e1.value,Tuple) && (1 <= j <= length(e1.value))
+                elseif isa(e1,QuoteNode) && isa(e1.value,Tuple) && isa(j,Int) && (1 <= j <= length(e1.value))
                     e.args[i] = QuoteNode(e1.value[j])
                 end
             end
@@ -3268,6 +3274,27 @@ function getfield_elim_pass(e::Expr, sv)
     end
 end
 
+# check if e is a successful allocation of an immutable struct
+# if it is, returns (n,f) such that it is always valid to call
+# getfield(..., 1 <= x <= n) or getfield(..., x in f) on the result
+function is_immutable_allocation(e :: ANY, sv::VarInfo)
+    isa(e, Expr) || return false
+    if is_known_call(e, tuple, sv)
+        return (length(e.args)-1,())
+    elseif e.head === :new
+        typ = exprtype(e, sv)
+        if isleaftype(typ) && !typ.mutable
+            @assert(isa(typ,DataType))
+            nf = nfields(typ)
+            length(e.args) == nf+1 || return false
+            for i=1:nf
+                exprtype(e.args[1+i],sv) <: fieldtype(typ,i) || return false
+            end
+            return (nf, fieldnames(typ))
+        end
+    end
+    false
+end
 # eliminate allocation of unnecessary tuples
 function tuple_elim_pass(ast::Expr, sv::VarInfo)
     bexpr = ast.args[3]::Expr
@@ -3283,10 +3310,11 @@ function tuple_elim_pass(ast::Expr, sv::VarInfo)
         end
         var = e.args[1]
         rhs = e.args[2]
-        if isa(rhs,Expr) && is_known_call(rhs, tuple, sv)
+        alloc = is_immutable_allocation(rhs, sv)
+        if !is(alloc,false)
+            nv, field_names = alloc
             tup = rhs.args
-            nv = length(tup)-1
-            if occurs_outside_getfield(bexpr, var, sv, nv) || !is_local(sv, var)
+            if occurs_outside_getfield(bexpr, var, sv, nv, field_names) || !is_local(sv, var)
                 i += 1
                 continue
             end
@@ -3309,14 +3337,14 @@ function tuple_elim_pass(ast::Expr, sv::VarInfo)
                 end
             end
             i += n_ins
-            replace_getfield!(ast, bexpr, var, vals, sv, i)
+            replace_getfield!(ast, bexpr, var, vals, field_names, sv, i)
         else
             i += 1
         end
     end
 end
 
-function replace_getfield!(ast, e::ANY, tupname, vals, sv, i0)
+function replace_getfield!(ast, e::ANY, tupname, vals, field_names, sv, i0)
     if !isa(e,Expr)
         return
     end
@@ -3324,7 +3352,14 @@ function replace_getfield!(ast, e::ANY, tupname, vals, sv, i0)
         a = e.args[i]
         if isa(a,Expr) && is_known_call(a, getfield, sv) &&
             symequal(a.args[2],tupname)
-            val = vals[a.args[3]]
+            idx = if isa(a.args[3], Int)
+                a.args[3]
+            else
+                @assert isa(a.args[3], QuoteNode)
+                findfirst(field_names, a.args[3].value)
+            end
+            @assert(idx > 0) # clients should check that all getfields are valid
+            val = vals[idx]
             # original expression might have better type info than
             # the tuple element expression that's replacing it.
             if isa(val,SymbolNode)
@@ -3347,7 +3382,7 @@ function replace_getfield!(ast, e::ANY, tupname, vals, sv, i0)
             end
             e.args[i] = val
         else
-            replace_getfield!(ast, a, tupname, vals, sv, 1)
+            replace_getfield!(ast, a, tupname, vals, field_names, sv, 1)
         end
     end
 end
